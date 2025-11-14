@@ -9,18 +9,26 @@ let package = Package(
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "TridiagonalMatrixAccelerate",
-            targets: ["TridiagonalMatrixAccelerate"]
+            targets: ["TridiagonalMatrixAccelerate"],
+			//dependencies: [.product(name: "Numerics", package: "swift-numerics")]
         ),
     ],
+	dependencies: [.package(url: "https://github.com/apple/swift-numerics.git", from: "1.0.0"),
+				   // Dependencies declare other packages that this package depends on.
+				   // .package(url: /* package url */, from: "1.0.0"),
+				  ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
-            name: "TridiagonalMatrixAccelerate"
+            name: "TridiagonalMatrixAccelerate",
+			dependencies: [.product(name: "Numerics", package: "swift-numerics")]
         ),
         .testTarget(
             name: "TridiagonalMatrixAccelerateTests",
-            dependencies: ["TridiagonalMatrixAccelerate"]
+			dependencies: ["TridiagonalMatrixAccelerate",.product(name: "Numerics", package: "swift-numerics")]
         ),
     ]
 )
+
+	
