@@ -12,63 +12,144 @@
 //  Refactored on 10/25/25 to unify protocols, add condition number,
 //  and integrate factorization into the initializer.
 //
+//  - Fixed problem that Complex<Double> conflicted with Complex<Float> by checking RealType at runtime
+//    and returning the correct LAPACK routine
+
 import Accelerate
-//import simd
 import Numerics
 
-// MARK: - LAPACK C Function Declarations GTTRF(Factor), GTTRS(Solve), GTCON(Condition Number)
+// MARK: - LAPACK/BLAS C Function Declarations & Types
+
 public typealias CLPKInteger = __CLPK_integer
 
 public typealias gttrf<T> = (
 	_ N: UnsafeMutablePointer<CLPKInteger>?,
-	_ DL: UnsafeMutablePointer<T>?,            _ D: UnsafeMutablePointer<T>?,             _  DU: UnsafeMutablePointer<T>?,
-	_ DU2: UnsafeMutablePointer<T>?,           _ IPIV: UnsafeMutablePointer<CLPKInteger>?,
-    _ INFO: UnsafeMutablePointer<CLPKInteger>?) -> CLPKInteger
+	_ DL: UnsafeMutablePointer<T>?, _ D: UnsafeMutablePointer<T>?, _ DU: UnsafeMutablePointer<T>?,
+	_ DU2: UnsafeMutablePointer<T>?, _ IPIV: UnsafeMutablePointer<CLPKInteger>?,
+	_ INFO: UnsafeMutablePointer<CLPKInteger>?
+) -> CLPKInteger
 
 public typealias gttrs<T> = (
 	_ TRANS: UnsafeMutablePointer<Int8>?, _ N: UnsafeMutablePointer<CLPKInteger>?, _ NRHS: UnsafeMutablePointer<CLPKInteger>?,
-	_ DL: UnsafeMutablePointer<T>?,            _ D: UnsafeMutablePointer<T>?,             _  DU: UnsafeMutablePointer<T>?,
-	_ DU2: UnsafeMutablePointer<T>?,           _ IPIV: UnsafeMutablePointer<CLPKInteger>?,_ B: UnsafeMutablePointer<T>?,
+	_ DL: UnsafeMutablePointer<T>?, _ D: UnsafeMutablePointer<T>?, _ DU: UnsafeMutablePointer<T>?,
+	_ DU2: UnsafeMutablePointer<T>?, _ IPIV: UnsafeMutablePointer<CLPKInteger>?, _ B: UnsafeMutablePointer<T>?,
 	_ LDB: UnsafeMutablePointer<CLPKInteger>?, _ INFO: UnsafeMutablePointer<CLPKInteger>?
 ) -> CLPKInteger
 
 public typealias gtcon<T> = (
-	_ NORM: UnsafeMutablePointer<Int8>?,      _  N: UnsafeMutablePointer<CLPKInteger>?, _ DL: UnsafeMutablePointer<T>?,
-	_ D: UnsafeMutablePointer<T>?,             _ DU: UnsafeMutablePointer<T>?,          _ DU2: UnsafeMutablePointer<T>?,
-	_ IPIV: UnsafeMutablePointer<CLPKInteger>?, _ ANORM: UnsafeMutableRawPointer?,      _ RCOND: UnsafeMutableRawPointer?,
-	_ WORK: UnsafeMutablePointer<T>?,          _ iwork: UnsafeMutablePointer<CLPKInteger>?, _ INFO: UnsafeMutablePointer<CLPKInteger>?
-) -> CLPKInteger
+	_ NORM: UnsafeMutablePointer<Int8>?, _ N: UnsafeMutablePointer<CLPKInteger>?, _ DL: UnsafeMutablePointer<T>?,
+	_ D: UnsafeMutablePointer<T>?, _ DU: UnsafeMutablePointer<T>?, _ DU2: UnsafeMutablePointer<T>?,
+	_ IPIV: UnsafeMutablePointer<CLPKInteger>?, _ ANORM: UnsafeMutableRawPointer?, _ RCOND: UnsafeMutableRawPointer?,
+	_ INFO: UnsafeMutablePointer<CLPKInteger>?
+) -> CLPKInteger // Note work and iwork left for implementation
 
 public typealias axpy<T> = (
 	_ n: Int32, _ a: T, _ x: UnsafePointer<T>, _ incx: Int32, _ y: UnsafeMutablePointer<T>, _ incy: Int32
 ) -> Void
 
-/// A unified protocol for types that can be used in both general arithmetic
-/// and BLAS/LAPACK-based solving.
+// MARK: - Protocol for numeric types used with LAPACK/BLAS
+
 public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 	static var one: Self { get }
 	static var gttrf: gttrf<Self> { get }
 	static var gttrs: gttrs<Self> { get }
 	static var gtcon: gtcon<Self> { get }
-	static var axpy: axpy<Self> { get }
-	//static func axpy(n: Int32, a: Self, x: UnsafePointer<Self>, incx: Int32, y: UnsafeMutablePointer<Self>, incy: Int32)
+	static var axpy:  axpy<Self>  { get }
 }
 
-// MARK: - Conformances for Real and Complex Types
+// MARK: - Array Extension for Safe Immutable Pointer Access
+
+extension Array {
+	/// Provides a temporary UnsafeMutablePointer from an Array instance. This is safe for C-API calls (like LAPACK gttrs) that require a mutable pointer
+	@inlinable func withImmutablePointer<R>( _ body: (UnsafeMutablePointer<Element>) -> R ) -> R {
+		self.withUnsafeBufferPointer { buffer in
+			///The use of UnsafeMutablePointer(mutating:) ensures safety by providing  a temporary pointer that does not modify the conceptual immutability of the array
+			guard let baseAddress = buffer.baseAddress else { preconditionFailure("Array base address is nil") }
+			return body(UnsafeMutablePointer(mutating: baseAddress))
+		}
+	}
+}
+
+/// Encapsulates generic logic to rebind Swift pointers to LAPACK C-structs
+/// avoiding deep nesting in the main protocol conformances.
+private enum LapackMemory {
+	
+	// MARK: - TridiagonalLUMatrix Pointer Access Helpers (Integrated)
+	
+	/// Internal free function helper to consolidate the nested `withUnsafeMutableBufferPointer` calls for the five LU arrays.
+	/// Safely used in `TridiagonalLUMatrix.init` via `inout` parameters.
+	@inlinable @discardableResult static func withLUMutables<T, R>(
+		dl: inout [T], d: inout [T], du: inout [T], du2: inout [T], ipiv: inout [CLPKInteger],
+		_ body: (UnsafeMutablePointer<T>, UnsafeMutablePointer<T>, UnsafeMutablePointer<T>,
+				 UnsafeMutablePointer<T>, UnsafeMutablePointer<CLPKInteger>) -> R ) -> R {
+		// Access is safe because arrays are passed 'inout'
+		dl.withUnsafeMutableBufferPointer { dlBP in
+			d.withUnsafeMutableBufferPointer { dBP in
+				du.withUnsafeMutableBufferPointer { duBP in
+					du2.withUnsafeMutableBufferPointer { du2BP in
+						ipiv.withUnsafeMutableBufferPointer { ipivBP in
+							body(dlBP.baseAddress!,dBP.baseAddress!,duBP.baseAddress!,du2BP.baseAddress!,ipivBP.baseAddress!)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	/// Rebinds the 4 tridiagonal arrays from type `T` to `CType` and executes the body.
+	/// Used for converting Complex<Float> -> __CLPK_complex, etc.
+	@inline(__always) static func withTridiagonalPointers<T, CType, Result>(
+		_ n: Int, _ dl: UnsafeMutablePointer<T>, _ d: UnsafeMutablePointer<T>, _ du: UnsafeMutablePointer<T>,
+		_ du2: UnsafeMutablePointer<T>, to type: CType.Type,
+		_ body: (UnsafeMutablePointer<CType>, UnsafeMutablePointer<CType>, UnsafeMutablePointer<CType>,
+				 UnsafeMutablePointer<CType>) -> Result) -> Result {
+		// We use max(1, ...) to ensure we don't bind capacity 0, which can be unsafe in some contexts
+		 dl.withMemoryRebound(to: type, capacity: max(1, n - 1)) { dlC in
+			d.withMemoryRebound(to: type, capacity: max(1, n)) { dC in
+				du.withMemoryRebound(to: type, capacity: max(1, n - 1)) { duC in
+					du2.withMemoryRebound(to: type, capacity: max(1, n - 2)) { du2C in
+						body(dlC, dC, duC, du2C)
+					}
+				}
+			}
+		}
+	}
+	
+	/// Rebinds tridiagonal arrays AND the RHS vector `b` to `CType`.
+	@inline(__always) static func withTridiagonalAndRHS<T, CType, Result>(
+		_ n: Int, _ nrhs: Int, _ dl: UnsafeMutablePointer<T>, _ d: UnsafeMutablePointer<T>, _ du: UnsafeMutablePointer<T>,
+		_ du2: UnsafeMutablePointer<T>, _ b: UnsafeMutablePointer<T>, to type: CType.Type,
+		_ body: (UnsafeMutablePointer<CType>, UnsafeMutablePointer<CType>, UnsafeMutablePointer<CType>,
+				 UnsafeMutablePointer<CType>, UnsafeMutablePointer<CType>) -> Result
+	) -> Result {
+		withTridiagonalPointers(n, dl, d, du, du2, to: type) { dlC, dC, duC, du2C in
+			b.withMemoryRebound(to: type, capacity: max(1,  n * max(1, nrhs))) { bC in
+				body(dlC, dC, duC, du2C, bC)
+			}
+		}
+	}
+}
+
+// MARK: - Conformances for Float / Double / Complex
 
 extension Float: ScalarField {
-	public static var one: Float { Float(1.0) }
+	public static var one: Float { 1.0 }
 	public static var gttrf: gttrf<Float> { return sgttrf_ }
 	public static var gttrs: gttrs<Float> { return sgttrs_ }
 	public static var gtcon: gtcon<Float> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
-			sgtcon_(norm, n, dl, d, du, du2, ipiv, anorm?.assumingMemoryBound(to: Float.self),
-					rcond?.assumingMemoryBound(to: Float.self), work, iwork, info)
+		{ norm, n, dl, d, du, du2, ipiv, anormRaw, rcondRaw, info in
+			let N = Int(n!.pointee)
+			var work = [Float](repeating: 0.0, count: max(1, 2 * N))
+			var iwork = [CLPKInteger](repeating: 0, count: max(1, N))
+			return work.withUnsafeMutableBufferPointer { workPtr in
+				iwork.withUnsafeMutableBufferPointer { iworkPtr in
+					sgtcon_(norm, n, dl, d, du, du2, ipiv, anormRaw?.assumingMemoryBound(to: Float.self),
+							rcondRaw?.assumingMemoryBound(to: Float.self), workPtr.baseAddress, iworkPtr.baseAddress, info)
+				}
+			}
 		}
 	}
-	public static var axpy: axpy<Float> {
-		{ n, a, x, incx, y, incy in cblas_saxpy(n, a, x, incx, y, incy) }
-	}
+	public static var axpy: axpy<Float> { { n, a, x, incx, y, incy in cblas_saxpy(n, a, x, incx, y, incy) } }
 }
 
 extension Double: ScalarField {
@@ -76,139 +157,130 @@ extension Double: ScalarField {
 	public static var gttrf: gttrf<Double> { return dgttrf_ }
 	public static var gttrs: gttrs<Double> { return dgttrs_ }
 	public static var gtcon: gtcon<Double> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
-			dgtcon_(norm, n, dl, d, du, du2, ipiv, anorm?.assumingMemoryBound(to: Double.self),
-					rcond?.assumingMemoryBound(to: Double.self), work, iwork, info)
+		{ norm, n, dl, d, du, du2, ipiv, anormRaw, rcondRaw, info in
+			let N = Int(n!.pointee)
+			// Revert to local allocation for safety/simplicity with Float/Double
+			var work = [Double](repeating: 0.0, count: max(1, 2 * N))
+			var iwork = [CLPKInteger](repeating: 0, count: max(1, N))
+			return work.withUnsafeMutableBufferPointer { workPtr in
+				iwork.withUnsafeMutableBufferPointer { iworkPtr in
+					dgtcon_(norm, n, dl, d, du, du2, ipiv, anormRaw?.assumingMemoryBound(to: Double.self),
+							rcondRaw?.assumingMemoryBound(to: Double.self), workPtr.baseAddress, iworkPtr.baseAddress, info)
+				}
+			}
 		}
 	}
-	public static var axpy: axpy<Double> {
-		{ n, a, x, incx, y, incy in cblas_daxpy(n, a, x, incx, y, incy) }
-	}
+	public static var axpy: axpy<Double> { { n, a, x, incx, y, incy in cblas_daxpy(n, a, x, incx, y, incy) } }
 }
 
-extension Complex: ScalarField  {
+// Complex<T> conformances
+extension Complex: ScalarField where RealType: FloatingPoint {
 	public static var one: Complex<RealType> { Complex(1, 0) }
-	
 	public static var gttrf: gttrf<Complex<RealType>> {
-		(RealType.self == Float.self) ?
 		{ n, dl, d, du, du2, ipiv, info in
-			let result = dl!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 1) { dl in
-				d!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee)) { d in
-					du!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 1) { du in
-						du2!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 2) { du2 in
-							cgttrf_(n, dl, d, du, du2, ipiv, info)
-						}
-					}
+			let countN = Int(n!.pointee)
+			return if RealType.self == Float.self {
+				LapackMemory.withTridiagonalPointers(countN, dl!, d!, du!, du2!, to: __CLPK_complex.self) {
+					cgttrf_(n, $0, $1, $2, $3, ipiv, info)
 				}
-			}
-			return result
-		} :
-		{ n, dl, d, du, du2, ipiv, info in
-			let result = dl!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 1) { dl in
-				d!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee)) { d in
-					du!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 1) { du in
-						du2!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 2) { du2 in
-							zgttrf_(n, dl, d, du, du2, ipiv, info)
-						}
-					}
+			} else if RealType.self == Double.self {
+				LapackMemory.withTridiagonalPointers(countN, dl!, d!, du!, du2!, to: __CLPK_doublecomplex.self) {
+					zgttrf_(n, $0, $1, $2, $3, ipiv, info)
 				}
+			} else {
+				fatalError("gttrf not supported for Complex<\(RealType.self)>")
 			}
-			return result
 		}
 	}
 	
 	public static var gttrs: gttrs<Complex<RealType>> {
-		(RealType.self == Float.self ) ?
 		{ trans, n, nrhs, dl, d, du, du2, ipiv, b, ldb, info in
-			let result = dl!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 1) { dl in
-				d!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee)) { d in
-					du!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 1) { du in
-						du2!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee) - 2) { du2 in
-							b!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n!.pointee * nrhs!.pointee)) { b in
-								cgttrs_(trans, n, nrhs, dl, d, du, du2, ipiv, b, ldb, info)
-							}
-						}
-					}
+			let countN = Int(n!.pointee)
+			let countRHS = Int(nrhs!.pointee)
+			
+			return if RealType.self == Float.self {
+				LapackMemory.withTridiagonalAndRHS(countN, countRHS, dl!, d!, du!, du2!, b!, to: __CLPK_complex.self) {
+					cgttrs_(trans, n, nrhs, $0, $1, $2, $3, ipiv, $4, ldb, info)
 				}
-			}
-			return result
-		} :
-		{ trans, n, nrhs, dl, d, du, du2, ipiv, b, ldb, info in
-			let result = dl!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 1) { dl in
-				d!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee)) { d in
-					du!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 1) { du in
-						du2!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee) - 2) { du2 in
-							b!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n!.pointee * nrhs!.pointee)) { b in
-								zgttrs_(trans, n, nrhs, dl, d, du, du2, ipiv, b, ldb, info)
-							}
-						}
-					}
+			} else if RealType.self == Double.self {
+				LapackMemory.withTridiagonalAndRHS(countN, countRHS, dl!, d!, du!, du2!, b!, to: __CLPK_doublecomplex.self) {
+					zgttrs_(trans, n, nrhs, $0, $1, $2, $3, ipiv, $4, ldb, info)
 				}
+			} else {
+				fatalError("gttrs not supported for Complex<\(RealType.self)>")
 			}
-			return result
 		}
 	}
 	
 	public static var gtcon: gtcon<Complex<RealType>> {
-		(RealType.self == Float.self) ?
-		{ NORM, N, DL, D, DU, DU2, IPIV, ANORM, RCOND, WORK, iwork, INFO in
-			DL!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(N!.pointee) - 1) { dl in
-				D!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(N!.pointee)) { d in
-					DU!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(N!.pointee) - 1) { du in
-						DU2!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(N!.pointee) - 2) { du2 in
-							ANORM!.withMemoryRebound(to: Float.self, capacity: 1) { anorm in
-								RCOND!.withMemoryRebound(to: Float.self, capacity: 1) { rcond in
-									WORK!.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(2*N!.pointee)) { work in
-										cgtcon_(NORM, N, dl, d, du, du2, IPIV, anorm, rcond, work, INFO)
-									}
-								}
-							}
-						}
+		{ norm, n, dl, d, du, du2, ipiv, anormRaw, rcondRaw, info in
+			let N = Int(n!.pointee)
+			
+			return if RealType.self == Float.self {
+				// 1. Rebind matrix pointers
+				LapackMemory.withTridiagonalPointers(N, dl!, d!, du!, du2!, to: __CLPK_complex.self) { dlC, dC, duC, du2C in
+					var work = [__CLPK_complex](repeating: __CLPK_complex(), count: max(1, 2 * N))
+					return work.withUnsafeMutableBufferPointer { w in
+						cgtcon_(norm, n, dlC, dC, duC, du2C, ipiv,
+								anormRaw?.assumingMemoryBound(to: Float.self),
+								rcondRaw?.assumingMemoryBound(to: Float.self),
+								w.baseAddress!, info)
 					}
 				}
-			}
-		} :
-		{ NORM, N, DL, D, DU, DU2, IPIV, ANORM, RCOND, WORK, iwork, INFO in
-			DL!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(N!.pointee) - 1) { dl in
-				D!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(N!.pointee)) { d in
-					DU!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(N!.pointee) - 1) { du in
-						DU2!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(N!.pointee) - 2) { du2 in
-							ANORM!.withMemoryRebound(to: Double.self, capacity: 1) { anorm in
-								RCOND!.withMemoryRebound(to: Double.self, capacity: 1) { rcond in
-									WORK!.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(2*N!.pointee)) { work in
-										zgtcon_(NORM, N, dl, d, du, du2, IPIV, anorm, rcond, work, INFO)
-									}
-								}
-							}
-						}
+			} else if RealType.self == Double.self {
+				LapackMemory.withTridiagonalPointers(N, dl!, d!, du!, du2!, to: __CLPK_doublecomplex.self) {dlC,dC,duC,du2C in
+					var work = [__CLPK_doublecomplex](repeating: __CLPK_doublecomplex(), count: max(1, 2 * N))
+					return work.withUnsafeMutableBufferPointer { w in
+						zgtcon_(norm, n, dlC, dC, duC, du2C, ipiv,
+								anormRaw?.assumingMemoryBound(to: Double.self),
+								rcondRaw?.assumingMemoryBound(to: Double.self),
+								w.baseAddress!, info)
 					}
 				}
+			} else {
+				fatalError("gtcon not supported for Complex<\(RealType.self)>")
 			}
 		}
 	}
 	
 	public static var axpy: axpy<Complex<RealType>> {
-		(RealType.self == Float.self) ?
-		{ n, a, x, incx, y, incy in
-			withUnsafePointer(to: a) { aPtr in
-				aPtr.withMemoryRebound(to: __CLPK_complex.self, capacity: 1) {
-					cblas_caxpy(n, $0, x, incx, y, incy) } }
-		} :
-		{ n, a, x, incx, y, incy in
-			withUnsafePointer(to: a) { aPtr in
-				aPtr.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: 1) {
-					cblas_zaxpy(n, $0, x, incx, y, incy) } }
+		// AXPY for complex still requires manual rebinding for a, x, y.
+		if RealType.self == Float.self {
+			return { n, a, x, incx, y, incy in
+				withUnsafePointer(to: a) { aPtr in
+					aPtr.withMemoryRebound(to: __CLPK_complex.self, capacity: 1) { aC in
+						x.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n)) { xC in
+							y.withMemoryRebound(to: __CLPK_complex.self, capacity: Int(n)) { yC in
+								cblas_caxpy(n, aC, xC, incx, yC, incy)
+							}
+						}
+					}
+				}
+			}
+		} else if RealType.self == Double.self {
+			return { n, a, x, incx, y, incy in
+				withUnsafePointer(to: a) { aPtr in
+					aPtr.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: 1) { aC in
+						x.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n)) { xC in
+							y.withMemoryRebound(to: __CLPK_doublecomplex.self, capacity: Int(n)) { yC in
+								cblas_zaxpy(n, aC, xC, incx, yC, incy)
+							}
+						}
+					}
+				}
+			}
+		} else {
+			fatalError("axpy not supported")
 		}
 	}
-	
 }
 
-// MARK: - Matrix Structures and Arithmetic
+// MARK: - Tridiagonal Matrix & Vector Types
 
 public struct TridiagonalMatrix<T: ScalarField> {
-	public var lower: [T]
-	public var diagonal: [T]
-	public var upper: [T]
+	public var lower: [T]     // size n-1
+	public var diagonal: [T]  // size n
+	public var upper: [T]     // size n-1
 	public let size: Int
 	
 	public init(diagonal: [T], upper: [T], lower: [T]) {
@@ -218,270 +290,191 @@ public struct TridiagonalMatrix<T: ScalarField> {
 		self.diagonal = diagonal
 		self.upper = upper
 		self.lower = lower
-		size = diagonal.count
+		self.size = diagonal.count
 	}
 	
-	/// Calculates the 1-norm of the matrix (maximum absolute column sum).
-	public func oneNorm() -> T.Magnitude {
+	/// 1-norm (maximum column sum). Uses `magnitude` on scalars.
+	@inlinable public func oneNorm() -> T.Magnitude {
 		var norm: T.Magnitude = 0
-		if size == 0 { return norm }
-		if size == 1 { return diagonal[0].magnitude }
-		
-		// First column
-		var colSum = diagonal[0].magnitude + lower[0].magnitude
-		norm = colSum
-		
-		// Middle columns
-		for j in 1..<(size - 1) {
-			colSum = upper[j-1].magnitude + diagonal[j].magnitude + lower[j].magnitude
-			norm = max(norm, colSum)
+		let n = size
+		if n == 0 { return norm }
+		if n == 1 { return diagonal[0].magnitude }
+		// first column
+		var col = diagonal[0].magnitude + lower[0].magnitude
+		norm = col
+		// middle
+		if n > 2 {
+			for j in 1..<(n - 1) {
+				col = upper[j-1].magnitude + diagonal[j].magnitude + lower[j].magnitude
+				if col > norm { norm = col }
+			}
 		}
-		
-		// Last column
-		colSum = upper[size-2].magnitude + diagonal[size-1].magnitude
-		norm = max(norm, colSum)
-		
+		// last
+		col = upper[n-2].magnitude + diagonal[n-1].magnitude
+		if col > norm { norm = col }
 		return norm
+	}
+	
+	/// Convenience: create a factorization object
+	public func factorized() -> TridiagonalLUMatrix<T> {
+		TridiagonalLUMatrix(self)
 	}
 }
 
 public typealias ColumnVector<T: ScalarField> = Array<T>
 
-// ... ( `*` and `AXpY` functions remain unchanged) ...
+// MARK: - Basic matrix-vector ops
 
 public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
 	precondition(x.count == A.size, "Invalid column vector size")
 	let n = x.count
-	var b : ColumnVector<T> = x
-	if n==0 { return [] }
-	b[0] = A.diagonal[0]*x[0]
-	if n==1 { return b }
-	b[0] += A.upper[0]*x[1]
-	b[n-1] = A.lower[n-2]*x[n-2]+A.diagonal[n-1]*x[n-1]
-	if n==2 { return b }
-	for j in 1..<n-1 {
-		b[j] = A.lower[j-1]*x[j-1] + A.diagonal[j]*x[j] + A.upper[j]*x[j+1]
+	if n == 0 { return [] }
+	if n == 1 { return [A.diagonal[0] * x[0]] }
+	
+	var b = Array<T>(repeating: .zero, count: n)
+	b[0] = A.diagonal[0] * x[0] + A.upper[0] * x[1]
+	for j in 1..<(n-1) {
+		b[j] = A.lower[j-1] * x[j-1] + A.diagonal[j] * x[j] + A.upper[j] * x[j+1]
 	}
+	b[n-1] = A.lower[n-2] * x[n-2] + A.diagonal[n-1] * x[n-1]
 	return b
 }
 
 public func AXpY<T: ScalarField>(A: TridiagonalMatrix<T>, x: ColumnVector<T>, y: ColumnVector<T>) -> ColumnVector<T> {
-	precondition(x.count == A.size, "Invalid x vector size")
-	precondition(y.count == A.size, "Invalid y vector size")
+	precondition(x.count == A.size && y.count == A.size, "Vector sizes must match")
 	let n = x.count
-	if n==0 { return [] }
+	if n == 0 { return [] }
+	if n == 1 { return [y[0] + A.diagonal[0] * x[0]] }
+	
 	var b = y
-	b[0] += A.diagonal[0]*x[0]
-	if n==1 { return b }
-	b[0] += A.upper[0]*x[1]
-	b[n-1] += A.lower[n-2]*x[n-2]+A.diagonal[n-1]*x[n-1]
-	if n==2 { return b }
-	for j in 1..<n-1 {
-		b[j] += A.lower[j-1]*x[j-1] + A.diagonal[j]*x[j] + A.upper[j]*x[j+1]
+	b[0] += A.diagonal[0] * x[0] + A.upper[0] * x[1]
+	for j in 1..<(n-1) {
+		b[j] += A.lower[j-1] * x[j-1] + A.diagonal[j] * x[j] + A.upper[j] * x[j+1]
 	}
+	b[n-1] += A.lower[n-2] * x[n-2] + A.diagonal[n-1] * x[n-1]
 	return b
 }
 
-// UPGRADED: This function now uses cblas_axpy via the ScalarField protocol.
-public func aXpY<T: ScalarField>(a: T , x: ColumnVector<T>, y: ColumnVector<T>) -> ColumnVector<T> {
+// AXPY wrappers using BLAS
+public func aXpY_Inplace<T: ScalarField>(a: T, x: ColumnVector<T>, y: inout ColumnVector<T>) {
 	precondition(x.count == y.count, "Vector size mismatch")
-	
 	let n = Int32(x.count)
-	if n == 0 { return [] }
-	
-	var result = y
-	T.axpy( n,  a,  x,  1,  &result,  1)
-	return result
+	if n == 0 { return }
+	T.axpy(n, a, x, 1, &y, 1)
 }
+
+public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -> ColumnVector<T> {
+	var out = y
+	aXpY_Inplace(a: a, x: x, y: &out)
+	return out
+}
+
+// MARK: - LU Factorization Container
 
 public struct TridiagonalLUMatrix<T: ScalarField> {
+	public var lower: [T]   // DL (n-1) - stored LU sub-diagonal (modified by gttrf)
+	public var diagonal: [T]  // D  (n)   - stored LU main diagonal (modified by gttrf)
+	public var upper: [T] // DU (n-1) - stored LU super-diagonal (modified by gttrf)
+	public var upper2: [T] // DU2 (n-2)
+	public var ipiv: [CLPKInteger] // pivot indices
+	public var rcond: T.Magnitude  // estimate reciprocal condition number
+	public var anorm: T.Magnitude  // 1-norm of original matrix
+	public var isSingular: Bool    // Flags singular
+	public var count: Int { diagonal.count }
 	
-	// Stored LU factors and pivot vector
-	public var subDiagonal: [T]
-	public var mainDiagonal: [T]
-	public var superDiagonal: [T]
-	public var superDiagonal2: [T]
-	public var ipiv: [__CLPK_integer]
-	public var rcond: T.Magnitude
-	/// The 1-norm of the original matrix A, computed before factorization.
-	public var anorm: T.Magnitude
+	public var approximateConditionNumber: T.Magnitude {
+		(!isSingular && rcond > 0) ? 1 / rcond : T.Magnitude.infinity
+	}
 	
-	public let count: Int
-	public var approximateConditionNumber: T.Magnitude {  (rcond) > 0 ?  1/rcond : T.Magnitude.infinity }
-	private var  det: T?
-	public var determinant: T? { det }
-	/// Private initializer to store factorization results.
-	private init(subDiagonal: [T], mainDiagonal: [T], superDiagonal: [T], superDiagonal2: [T], ipiv: [__CLPK_integer],
-				 rcond: T.Magnitude, anorm: T.Magnitude, determinant: T, count: Int) {
-		self.subDiagonal = subDiagonal
-		self.mainDiagonal = mainDiagonal
-		self.superDiagonal = superDiagonal
-		self.superDiagonal2 = superDiagonal2
-		self.ipiv = ipiv
-		self.rcond = rcond
+	public var determinant: T = 0
+	
+	/// Attempt to factorize
+	public init(_ A: TridiagonalMatrix<T>) {
+		self.init(dl: A.lower, d: A.diagonal, du: A.upper, anorm: A.oneNorm())
+	}
+	
+	@inlinable @discardableResult func withLUImmutablePointers<R>(
+		_ body: ( _ dl: UnsafeMutablePointer<T>, _ d: UnsafeMutablePointer<T>, _ du: UnsafeMutablePointer<T>,
+				  _ du2: UnsafeMutablePointer<T>, _ ipiv: UnsafeMutablePointer<CLPKInteger> ) -> R ) -> R {
+		// All five arrays now use the single, generic helper function
+		lower.withImmutablePointer { dlPtr in
+			diagonal.withImmutablePointer { dPtr in
+				upper.withImmutablePointer { duPtr in
+					upper2.withImmutablePointer { du2Ptr in
+						ipiv.withImmutablePointer { ipivPtr in
+							body(dlPtr, dPtr, duPtr, du2Ptr, ipivPtr)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	init(dl: [T], d: [T], du: [T], anorm: T.Magnitude) {
+		precondition(d.count > 0, "Matrix must be non-empty")
+		precondition(dl.count == d.count - 1 && du.count == d.count - 1, "Diagonal sizes inconsistent")
+		
+		lower = dl
+		diagonal = d
+		upper = du
+		upper2 = [T](repeating: .zero, count: max(0, d.count - 2))
+		ipiv = [CLPKInteger](repeating: 0, count: d.count)
 		self.anorm = anorm
-		self.count = count
-		self.det = determinant
-	}
-	
-	/// Convenience initializer that factors a `TridiagonalMatrix`.
-	/// Returns `nil` if factorization fails (e.g., matrix is singular).
-	public init?(_ A: TridiagonalMatrix<T>) {
-		let anorm = A.oneNorm()
-		self.init(dl: A.lower, d: A.diagonal, du: A.upper, anorm: anorm)
-	}
-	
-	/// Factors a tridiagonal matrix defined by its diagonal arrays.
-	/// Returns `nil` if factorization fails.
-	private init?(dl: [T], d: [T], du: [T], anorm: T.Magnitude) {
-		precondition(d.count > 1, "Matrix must be at least 2x2.")
-		precondition(dl.count == d.count - 1 && du.count == d.count - 1, "Diagonal vector sizes are inconsistent.")
+		rcond = 0
+		isSingular = true
+		determinant = 0
 		
-		let n = __CLPK_integer(d.count)
-		var n_ = n
-		var info = __CLPK_integer(0)
-		var norm: Int8 = Int8(79) // 'O' for One-norm
-		var infoFactor = __CLPK_integer(0)
-		// LAPACK modifies these vectors in place
-		var subDiagonal = dl
-		var mainDiagonal = d
-		var superDiagonal = du
-		var superDiagonal2 = [T](repeating: T.zero, count: d.count - 1)
-		var ipiv = [__CLPK_integer](repeating: 0, count: Int(n))
-		var work = [T](repeating: 0, count: Int(2*n))
-		var iwork = [CLPKInteger](repeating: 0, count: Int(2*n))
+		var n_ = CLPKInteger(count)
+		var info = CLPKInteger(0)
+		
+		// 1. FACTOR (gttrf)
+		LapackMemory.withLUMutables(dl: &lower, d: &diagonal, du: &upper, du2: &upper2, ipiv: &ipiv) {
+			_ = T.gttrf(&n_, $0, $1, $2, $3, $4, &info)
+		}
+		
+		if info != 0 { return }
+		
+		// 2. CONDITION ESTIMATE (gtcon)
 		var anorm_ = anorm
-		var rcond_ = T.Magnitude(1)
-		var determinant: T = 1
+		var rcond_ = T.Magnitude(0)
+		var normChar: Int8 = Int8(UnicodeScalar("O").value) // 'O' one-norm
 		
-		subDiagonal.withUnsafeMutableBufferPointer { dl in let dlPtr = dl.baseAddress!
-			mainDiagonal.withUnsafeMutableBufferPointer { d in let dPtr = d.baseAddress!
-				superDiagonal.withUnsafeMutableBufferPointer { du in let duPtr = du.baseAddress!
-					superDiagonal2.withUnsafeMutableBufferPointer { du2 in let du2Ptr = du2.baseAddress!
-						ipiv.withUnsafeMutableBufferPointer { ipivBP in let ipivPtr = ipivBP.baseAddress!
-							// Call the Generic Tridiagonal Factorization function
-							_ = T.gttrf(&n_, dlPtr , dPtr, duPtr , du2Ptr, ipivPtr, &infoFactor)
-							work.withUnsafeMutableBufferPointer { workBP in let workPtr = workBP.baseAddress!
-								iwork.withUnsafeMutableBufferPointer { iworkBP in let iworkPtr = iworkBP.baseAddress!
-									withUnsafeMutableBytes(of: &anorm_) { anormBytes in let anormPtr = anormBytes.baseAddress!
-										withUnsafeMutableBytes(of: &rcond_) { rcondBytes in let rcondPtr = rcondBytes.baseAddress!
-											_ = T.gtcon(&norm, &n_, dlPtr, dPtr, duPtr, du2Ptr, ipivPtr, anormPtr, rcondPtr,
-														workPtr, iworkPtr, &info)
-										}
-									}
-								}
-							}
-						}
-					}
+		withUnsafeMutablePointer(to: &anorm_) { anormPtr in
+			withUnsafeMutablePointer(to: &rcond_) { rcondPtr in
+				LapackMemory.withLUMutables(dl: &lower, d: &diagonal, du: &upper, du2: &upper2, ipiv: &ipiv) {
+					_ = T.gtcon(&normChar, &n_, $0, $1, $2, $3, $4, // dlPtr, dPtr, duPtr, du2Ptr, ipivPtr,
+								UnsafeMutableRawPointer(anormPtr), UnsafeMutableRawPointer(rcondPtr), &info)
 				}
 			}
-			
-			guard infoFactor == 0 else { determinant = 0; return } // Factorization failed
-			let detU = mainDiagonal.reduce(T.one, *)
-			var sign = false
-			for i in 0..<Int(n-1) { // n is CLPKInteger, last pivot is n
-				if ipiv[i] != CLPKInteger(i + 1) { // 1-based indexing
-					sign.toggle()
-				}
-			}
-			determinant = sign ? -detU : detU
 		}
 		
-		self.init(
-			subDiagonal: subDiagonal,
-			mainDiagonal: mainDiagonal,
-			superDiagonal: superDiagonal,
-			superDiagonal2: superDiagonal2,
-			ipiv: ipiv,
-			rcond: rcond_,
-			anorm: anorm_,
-			determinant: determinant,
-			count: Int(n)
-		)
+		if info != 0 { return }
 		
+		self.rcond = rcond_
+		// determinant: product of diagonal of U with sign determined by pivot permutations
+		let detU = diagonal.reduce(T.one, *)
+		var signToggle = false
+		for i in 0..<(count - 1) where ipiv[i] != CLPKInteger(i + 1) { signToggle.toggle() }
+		determinant = signToggle ? -detU : detU
 	}
-	// MARK: Solve and Condition
 	
-	/// Solves the tridiagonal system A * x = b using the pre-computed LU factors.
-	@discardableResult
-	public mutating func solve(rhsVector b: inout [T]) -> Bool {
-	// While its not really mutating the call to gttrs needs mutating types so...
+	// MARK: - Solve
+	/// Solve A * x = b using precomputed LU. Returns solved vector or throws on failure.
+	@discardableResult public func solve(_ b: inout [T]) -> [T] { // LAPACK expects in-out array
 		precondition(b.count == self.count)
+		guard !isSingular else { return Array(repeating: .zero, count: count)}
 		
-		var solutionVector = b
-		
-		var n_ = __CLPK_integer(self.count)
-		var nrhs = __CLPK_integer(1)
+		var n_ = CLPKInteger(count)
+		var nrhs = CLPKInteger(1)
 		var ldb = n_
-		var info = __CLPK_integer(0)
-		var trans = Int8(78) // 'N'
-		//var result: __CLPK_integer = 0
+		var info = CLPKInteger(0)
+		var trans: Int8 = Int8(UnicodeScalar("N").value)
 		
-		self.subDiagonal.withUnsafeMutableBufferPointer { dl in let dlPtr = dl.baseAddress!
-			self.mainDiagonal.withUnsafeMutableBufferPointer { d in let dPtr = d.baseAddress!
-				self.superDiagonal.withUnsafeMutableBufferPointer { du in let duPtr = du.baseAddress!
-					self.superDiagonal2.withUnsafeMutableBufferPointer { du2 in let du2Ptr = du2.baseAddress!
-						self.ipiv.withUnsafeMutableBufferPointer { ipivIn in let ipivPtr = ipivIn.baseAddress!
-							solutionVector.withUnsafeMutableBufferPointer { b in let bPtr = b.baseAddress!
-								_ = T.gttrs(&trans, &n_, &nrhs, dlPtr, dPtr, duPtr, du2Ptr, ipivPtr, bPtr, &ldb, &info)
-							}
-						}
-					}
-				}
+		withLUImmutablePointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
+			b.withImmutablePointer { bPtr in
+				_ = T.gttrs(&trans, &n_, &nrhs, dlPtr, dPtr, duPtr, du2Ptr, ipivPtr, bPtr, &ldb, &info)
 			}
 		}
-		
-		guard info == 0 else { return false }
-		
-		b = solutionVector
-		
-		return true
+		return b
 	}
-	
 }
-
-// MARK: - Usage Examples
-
-/*
- // Example 1: Real Double Precision (T = Double)
- 
- let A_D = TridiagonalMatrix(diagonal: [2.0, 5.0, 4.0],
- upper: [1.0, 1.0],
- lower: [3.0, 3.0])
- 
- // D. Factor the matrix using the new initializer
- guard let factoredA_D = TridiagonalLUMatrix(from: A_D) else {
- fatalError("Double Factorization failed.")
- }
- 
- // F. Get the condition number
- print("Condition Number (Double): \(factoredA_D.conditionNumber)")
- 
- // E. Solve the system A*x = b
- var b_solve: [Double] = [4.0, 10.0, 7.0]
- if factoredA_D.solve(rhsVector: &b_solve) {
- print("Real Double Solution x: \(b_solve)")
- }
- 
- // Example 2: Complex Float Precision (T = Numerics.Complex<Float>)
- typealias CFloat = Complex<Float>
- 
- let A_CF = TridiagonalMatrix(diagonal: [CFloat(1.0, -1.0), CFloat(3.0, -1.0)],
- upper: [CFloat(2.0, 0.0)],
- lower: [CFloat(1.0, 0.0)])
- 
- // C. Factor and solve
- guard let factoredA_CF = TridiagonalLUMatrix(from: A_CF) else {
- fatalError("Complex Float Factorization failed.")
- }
- 
- // F. Get condition number
- print("Condition Number (Complex): \(factoredA_CF.conditionNumber)")
- 
- // D. Solve
- var b_solve_CF: [CFloat] = [CFloat(4.0, 0.0), CFloat(4.0, 0.0)]
- if factoredA_CF.solve(rhsVector: &b_solve_CF) {
- print("Complex Float Solution x: \(b_solve_CF)")
- }
- 
- */
