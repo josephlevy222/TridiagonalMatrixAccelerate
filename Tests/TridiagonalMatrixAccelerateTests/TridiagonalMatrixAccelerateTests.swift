@@ -20,6 +20,10 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 	func testNormal() throws {
 		try testExample(Complex<Double>(2.0,0.0), det: Complex<Double>(6.0,0.0))
 	}
+	func testNormalwithWorkSpace() throws {
+		let workspace = TridiagonalWorkspace<Complex<Double>>(capacity: 10)
+		try testExample(Complex<Double>(2.0,0.0), det: Complex<Double>(6.0,0.0),workspace: workspace)
+	}
 	func testSingular() throws {
 		try testExample(Complex<Float>(1.0,0.0), det: Complex<Float>(0.0,0.0))
 	}
@@ -90,14 +94,14 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		assertVectorsApproximatelyEqual(result, expected, tolerance: 1e-15)
 	}
 	
-	private func testExample<T : ScalarField >(_ d: T, det: T)  throws {
+	private func testExample<T : ScalarField >(_ d: T, det: T, workspace: TridiagonalWorkspace<T>? = nil)  throws {
 		let one = T.one
 		let zero = T.zero
 		let lower = [one,one,one,one]
 		let upper = lower
 		let diagonal = [d,d,d,d,d]
 		let tridiag = TridiagonalMatrix(diagonal: diagonal, upper: upper, lower: lower)
-		let tridiagLU =  TridiagonalLUMatrix(tridiag)
+		let tridiagLU =  TridiagonalLUMatrix(tridiag, workspace: workspace)
 		let i = [ [one,zero,zero,zero,zero],
 				  [zero,one,zero,zero,zero],
 				  [zero,zero,one,zero,zero],
