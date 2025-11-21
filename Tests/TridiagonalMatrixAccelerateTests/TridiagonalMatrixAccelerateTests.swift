@@ -39,7 +39,7 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		assertVectorsApproximatelyEqual(result_d, expected_d, tolerance: 1e-15)
 		
 		// Test with Complex<Float>
-		typealias CFloat = Complex<Float>
+		typealias CFloat = Complex<Double>
 		let a_c = CFloat(1.0, 1.0) // (1+i)
 		let x_c = [CFloat(2.0, 0.0), CFloat(0.0, 3.0)] // [2, 3i]
 		let y_c = [CFloat(10.0, 0.0), CFloat(20.0, 0.0)] // [10, 20]
