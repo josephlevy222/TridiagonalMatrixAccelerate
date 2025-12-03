@@ -373,16 +373,13 @@ public struct TridiagonalLUMatrix<T: ScalarField> {
 		isSingular = true
 		determinant = 0
 
-		var n_ = CInt(count)
+		var n_ = CInt(d.count)
 		var info = CInt(0)
 
 		// 1. FACTOR (gttrf)
-		withMutableLUBufferPointers { //dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
-			_ = T.gttrf(&n_, $0, $1, $2, $3, $4, &info)
-		}
-
-		if info != 0 { return }
+		withMutableLUBufferPointers {  _ = T.gttrf(&n_, $0, $1, $2, $3, $4, &info) } //dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
 		
+		if info != 0 { return }
 		isSingular = false
 		
 		// 2. Calculate Determinant
