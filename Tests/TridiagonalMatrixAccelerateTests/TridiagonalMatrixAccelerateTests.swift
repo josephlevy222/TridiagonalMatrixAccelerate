@@ -128,6 +128,130 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		XCTAssertTrue(detError < detTolerance, "Determinant error \(detError) exceeds tolerance \(detTolerance)")
 		XCTAssertTrue(okay || tridiagLU.approximateConditionNumber.isInfinite )
 	}
+	
+	
+	/// Simple deterministic RNG for reproducible randomized tests.
+	struct DeterministicRNG {
+		private var state: UInt64
+		init(seed: UInt64) { state = seed }
+		mutating func nextDouble(in range: ClosedRange<Double>) -> Double {
+			// xorshift64* LCG-like step for determinism
+			state &+= 0x9E3779B97F4A7C15
+			var z = state
+			z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+			z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+			z = z ^ (z >> 31)
+			let unit = Double(z & 0xFFFFFFFFFFFF) / Double(0xFFFFFFFFFFFF)
+			return range.lowerBound + unit * (range.upperBound - range.lowerBound)
+		}
+	}
+	
+	/// Dense Gaussian elimination solver for small systems (Double).
+	/// Used as a reference to cross-check the tridiagonal solver.
+	private func denseSolve(_ A: TridiagonalMatrix<Double>, _ b: [Double]) -> [Double] {
+		let n = A.size
+		precondition(b.count == n)
+		if n == 0 { return [] }
+		// Build dense matrix
+		var M = Array(repeating: Array(repeating: 0.0, count: n), count: n)
+		for i in 0..<n {
+			M[i][i] = A.diagonal[i]
+			if i < n-1 {
+				M[i][i+1] = A.upper[i]
+				M[i+1][i] = A.lower[i]
+			}
+		}
+		// Gaussian elimination with partial pivoting
+		var Mflat = M
+		var rhs = b
+		for k in 0..<n {
+			// pivot
+			var pivot = k
+			var maxAbs = abs(Mflat[k][k])
+			for i in (k+1)..<n {
+				let v = abs(Mflat[i][k])
+				if v > maxAbs { maxAbs = v; pivot = i }
+			}
+			if pivot != k {
+				Mflat.swapAt(k, pivot)
+				rhs.swapAt(k, pivot)
+			}
+			let akk = Mflat[k][k]
+			// If pivot is zero, system is singular; return zeros to match current library behavior
+			if akk == 0 {
+				return Array(repeating: 0.0, count: n)
+			}
+			for i in (k+1)..<n {
+				let factor = Mflat[i][k] / akk
+				for j in k..<n {
+					Mflat[i][j] -= factor * Mflat[k][j]
+				}
+				rhs[i] -= factor * rhs[k]
+			}
+		}
+		// Back substitution
+		var x = Array(repeating: 0.0, count: n)
+		for i in stride(from: n-1, through: 0, by: -1) {
+			var s = rhs[i]
+			for j in (i+1)..<n {
+				s -= Mflat[i][j] * x[j]
+			}
+			let diag = Mflat[i][i]
+			if diag == 0 { return Array(repeating: 0.0, count: n) }
+			x[i] = s / diag
+		}
+		return x
+	}
+	
+	/// Randomized cross-check: compare LU solve to a dense reference solver for many small matrices.
+	func testRandomizedCrossCheck() {
+		var rng = DeterministicRNG(seed: 0xDEADBEEF)
+		for _ in 0..<100 {
+			let n = Int(rng.nextDouble(in: 2...10))
+			let diag = (0..<n).map { _ in rng.nextDouble(in: -10...10) }
+			let off = (0..<max(0, n-1)).map { _ in rng.nextDouble(in: -5...5) }
+			let A = TridiagonalMatrix(diagonal: diag, upper: off, lower: off)
+			var lu = TridiagonalLUMatrix(A)
+			let x = (0..<n).map { _ in rng.nextDouble(in: -2...2) }
+			var b = A * x
+			let xSolved = lu.solve(&b)
+			let xRef = denseSolve(A, A * x) // dense solve of same system
+			let err = zip(xSolved, xRef).map { abs($0 - $1) }.max() ?? 0.0
+			let tol = 1e-8 * max(1.0, lu.approximateConditionNumber)
+			XCTAssertLessThanOrEqual(err, tol, "Randomized cross-check failed (err=\(err), tol=\(tol))")
+		}
+	}
+	
+	/// Repeated solves to exercise workspace reuse and detect leaks/regressions.
+	func testRepeatedSolveStability() {
+		let n = 50
+		let diag = (0..<n).map { _ in Double.random(in: 1...10) }
+		let off = (0..<n-1).map { _ in Double.random(in: -1...1) }
+		let A = TridiagonalMatrix(diagonal: diag, upper: off, lower: off)
+		var lu = TridiagonalLUMatrix(A)
+		let x = (0..<n).map { _ in Double.random(in: -2...2) }
+		for _ in 0..<500 {
+			var b = A * x
+			let xSolved = lu.solve(&b)
+			let err = zip(xSolved, x).map { abs($0 - $1) }.max() ?? 0.0
+			XCTAssertLessThanOrEqual(err, 1e-8 * max(1.0, lu.approximateConditionNumber))
+		}
+	}
+	
+	/// Multithreaded smoke test: run many independent LU solves concurrently.
+	func testConcurrentSolves() {
+		let n = 30
+		let diag = (0..<n).map { _ in Double.random(in: 1...10) }
+		let off = (0..<n-1).map { _ in Double.random(in: -1...1) }
+		let iterations = 100
+		DispatchQueue.concurrentPerform(iterations: iterations) { _ in
+			let A = TridiagonalMatrix(diagonal: diag, upper: off, lower: off)
+			var lu = TridiagonalLUMatrix(A)
+			let x = (0..<n).map { _ in Double.random(in: -2...2) }
+			var b = A * x
+			let xSolved = lu.solve(&b)
+			let err = zip(xSolved, x).map { abs($0 - $1) }.max() ?? 0.0
+			XCTAssertLessThanOrEqual(err, 1e-7 * max(1.0, lu.approximateConditionNumber))
+		}
+	}
 }
-
-

@@ -71,7 +71,7 @@ public typealias axpy<T> = (_ n: Int32, _ a: T, _ x: UnsafePointer<T>, _ incx: I
 -> Void
 
 // MARK: - Backend protocol for complex precision bindings
-public protocol ComplexScalar: ScalarField & FloatingPoint { // Type that can be used in Complex<T>
+public protocol RealField: ScalarField & FloatingPoint { // Only Complex<RealField.Type> are allowed
 	associatedtype WType
 	static var cgttrf: gttrf<WType> { get }
 	static var cgttrs: gttrs<WType> { get }
@@ -91,35 +91,76 @@ public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 
 extension ScalarField {
 	public static var one: Self { 1 }
+	
+	/// Returns a 'gtcon' superset closure that wraps the Complex C function.
+	/// It accepts 'iwork' (to match the protocol) but ignores it.
+	static func makeRealGTCON<T, R>( _ cFunction: @escaping gtcon<T, R, T> ) -> gtcon<T, R, T> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
+			// Define the IWORK resolution logic (Allocates only if needed)
+			func withResolvedIWork(_ work: CMutablePtr<T>) -> CInt {
+				if let iwork { cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info) }
+				else {
+					withUnsafeTemporaryAllocation(of: CInt.self, capacity: max(1, Int(n!.pointee))) {
+						cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, $0.baseAddress!, info)
+					}
+				}
+			}
+			// Main Body: Resolve WORK and enter the chain
+			return if let work {
+				withResolvedIWork(work)
+			} else {
+				withUnsafeTemporaryAllocation(of: T.self, capacity: max(1, 2 * Int(n!.pointee))) {
+					withResolvedIWork($0.baseAddress!)
+				}
+			}
+		}
+	}
+	
+	static func makeComplexGTCON<T, R>( _ cFunction: @escaping gtconComplex<T, R, T> ) -> gtcon<T, R, T> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, unused, info in
+			if let work {
+				cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, info)
+			} else {
+				withUnsafeTemporaryAllocation(of: T.self, capacity: max(1, 2 * Int(n!.pointee))) {
+					cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, $0.baseAddress!, info)
+				}
+			}
+		}
+	}
+	
+	// Type to match cblas_caxpy
+	static func makeAXPY<CType>(_ cFunction: @escaping (
+		_ N: Int32, _ a: CVoidPtr?, _ X: CVoidPtr?, _ incX: Int32, _ Y: CMutableVoidPtr?, _ incY: Int32) -> Void
+	) -> axpy<CType> {/**/{ n, a, x, incx, y, incy in withUnsafePointer(to: a) { cFunction(n, $0, x, incx, y, incy) } }/**/}
 }
 
-extension Float: ScalarField, ComplexScalar {
+extension Float: ScalarField, RealField {
 	public static var gttrf: gttrf<Float> { sgttrf_ }
 	public static var gttrs: gttrs<Float> { sgttrs_ }
-	public static var gtcon: gtcon<Float,Float,Float> { AccelerateCallBuilder.makeRealGTCON(sgtcon_) }
+	public static var gtcon: gtcon<Float,Float,Float> { makeRealGTCON(sgtcon_) }
 	public static var axpy:  axpy<Float> { cblas_saxpy }
 	
 	public typealias WType = __CLPK_complex
 	public static var cgttrf: gttrf<WType> { cgttrf_ }
 	public static var cgttrs: gttrs<WType> { cgttrs_ }
-	public static var cgtcon: gtcon<WType, Float, WType> { AccelerateCallBuilder.makeComplexGTCON(cgtcon_) }
-	public static var caxpy: axpy<WType> { AccelerateCallBuilder.makeAXPY(cblas_caxpy) }
+	public static var cgtcon: gtcon<WType, Float, WType> { makeComplexGTCON(cgtcon_) }
+	public static var caxpy: axpy<WType> { makeAXPY(cblas_caxpy) }
 }
 
-extension Double: ScalarField, ComplexScalar {
+extension Double: ScalarField, RealField {
 	public static var gttrf: gttrf<Double> { dgttrf_ }
 	public static var gttrs: gttrs<Double> { dgttrs_ }
-	public static var gtcon: gtcon<Double,Double,Double> { AccelerateCallBuilder.makeRealGTCON(dgtcon_) }
+	public static var gtcon: gtcon<Double,Double,Double> { makeRealGTCON(dgtcon_) }
 	public static var axpy:  axpy<Double> { cblas_daxpy }
 	
 	public typealias WType = __CLPK_doublecomplex
 	public static var cgttrf: gttrf<WType> { zgttrf_ }
 	public static var cgttrs: gttrs<WType> { zgttrs_ }
-	public static var cgtcon: gtcon<WType, Double, WType> { AccelerateCallBuilder.makeComplexGTCON(zgtcon_) }
-	public static var caxpy:  axpy<WType> { AccelerateCallBuilder.makeAXPY(cblas_zaxpy) }
+	public static var cgtcon: gtcon<WType, Double, WType> { makeComplexGTCON(zgtcon_) }
+	public static var caxpy:  axpy<WType> { makeAXPY(cblas_zaxpy) }
 }
 
-extension Complex: ScalarField where RealType: ComplexScalar { // LAPACK calls must convert Complex to CLPKType
+extension Complex: ScalarField where RealType: RealField { // LAPACK calls must convert Complex to CLPKType
 	public typealias CType = RealType.WType
 	public static var gttrf: gttrf<Complex<RealType>> {
 		{ n, dl, d, du, du2, ipiv, info in
@@ -341,12 +382,14 @@ public struct TridiagonalLUMatrix<T: ScalarField> {
 		}
 
 		if info != 0 { return }
-
+		
+		isSingular = false
+		
 		// 2. Calculate Determinant
 		let detU = diagonal.reduce(T.one, *)
-		let signToggle = (0..<(count - 1)).reduce(into: false) { if ipiv[$1] != CInt($1+1) { $0.toggle() } }
+		let	signToggle = (0..<(count - 1)).reduce(into: false) { if Int(ipiv[$1]) != $1+1 { $0.toggle() } }
 		determinant = signToggle ? -detU : detU
-
+		
 		// 3. CONDITION ESTIMATE (gtcon)
 		var anorm_ = anorm
 		var rcond_ = T.Magnitude(0)
@@ -379,49 +422,6 @@ public struct TridiagonalLUMatrix<T: ScalarField> {
 	}
 }
 
-enum AccelerateCallBuilder {
-	/// Returns a 'gtcon' superset closure that wraps the Complex C function.
-	/// It accepts 'iwork' (to match the protocol) but ignores it.
-	static func makeRealGTCON<T, R>( _ cFunction: @escaping gtcon<T, R, T> ) -> gtcon<T, R, T> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
-			// Define the IWORK resolution logic (Allocates only if needed)
-			func withResolvedIWork(_ work: CMutablePtr<T>) -> CInt {
-				if let iwork { cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info) }
-				else {
-					withUnsafeTemporaryAllocation(of: CInt.self, capacity: max(1, Int(n!.pointee))) {
-						cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, $0.baseAddress!, info)
-					}
-				}
-			}
-			// Main Body: Resolve WORK and enter the chain
-			return if let work {
-				 withResolvedIWork(work)
-			} else {
-				withUnsafeTemporaryAllocation(of: T.self, capacity: max(1, 2 * Int(n!.pointee))) {
-					withResolvedIWork($0.baseAddress!)
-				}
-			}
-		}
-	}
-
-	static func makeComplexGTCON<T, R>( _ cFunction: @escaping gtconComplex<T, R, T> ) -> gtcon<T, R, T> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, unused, info in
-			 if let work {
-				cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, info)
-			} else {
-				withUnsafeTemporaryAllocation(of: T.self, capacity: max(1, 2 * Int(n!.pointee))) {
-					cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, $0.baseAddress!, info)
-				}
-			}
-		}
-	}
-
-	// Type to match cblas_caxpy
-	static func makeAXPY<CType>(_ cFunction: @escaping (
-		_ N: Int32, _ a: CVoidPtr?, _ X: CVoidPtr?, _ incX: Int32, _ Y: CMutableVoidPtr?, _ incY: Int32) -> Void
-	) -> axpy<CType> {/**/{ n, a, x, incx, y, incy in withUnsafePointer(to: a) { cFunction(n, $0, x, incx, y, incy) } }/**/}
-}
-
 public final class TridiagonalWorkspace<T: ScalarField> {
 
 	public private(set) var work: CMutablePtr<T.CType>
@@ -436,7 +436,7 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 		self.work = CMutablePtr<T.CType>.allocate(capacity: capacityWork)
 
 		// Only allocate iwork for real fields
-		if T.self is (any ComplexScalar) {
+		if T.self is any RealField.Type {
 			self.capacityIWork = 0
 			self.iwork = nil
 		} else {
@@ -463,7 +463,7 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 
 	/// RAII-style accessor: returns iwork only for real fields
 	public func iworkBuffer(for n: Int) -> CMutablePtr<CInt>? {
-		guard !(T.self is(any ComplexScalar)) else { return nil }
+		guard !(T.self is(any RealField)) else { return nil }
 		let required = max(1, n)
 		if capacityIWork < required {
 			iwork?.deallocate()
