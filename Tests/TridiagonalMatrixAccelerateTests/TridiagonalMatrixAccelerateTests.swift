@@ -111,7 +111,7 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		assertVectorsApproximatelyEqual(result, expected, tolerance: 1e-15)
 	}
 	
-	private func testExample<T : RealScalar >(_ d: T, det: T)  throws {
+	private func testExample<T : ScalarField >(_ d: T, det: T)  throws {
 		let one = T.one
 		let zero = T.zero
 		let lower = [one,one,one,one]
@@ -148,42 +148,6 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		XCTAssertTrue(okay || tridiagLU.approximateConditionNumber.isInfinite )
 	}
 	
-	private func testExample<T : RealScalar >(_ d: Complex<T>, det: Complex<T>)  throws {
-		let one = Complex<T>.one
-		let zero = Complex<T>.zero
-		let lower = [one,one,one,one]
-		let upper = lower
-		let diagonal = [d,d,d,d,d]
-		let tridiag = TridiagonalMatrix(diagonal: diagonal, upper: upper, lower: lower)
-		var tridiagLU =  TridiagonalLUMatrix(tridiag)
-		let i = [ [one,zero,zero,zero,zero],
-				  [zero,one,zero,zero,zero],
-				  [zero,zero,one,zero,zero],
-				  [zero,zero,zero,one,zero],
-				  [zero,zero,zero,zero,one] ]
-		let x = i.map {icol in var b = icol; return  tridiagLU.solve(&b) }
-		let ii = x.map {xcol in tridiag * xcol}
-		
-		var tolerance = T.Magnitude.ulpOfOne*2
-		let condition = tridiagLU.approximateConditionNumber
-		print("conditionNumber=\(condition)")
-		tolerance *= condition
-		print("tolerance=\(tolerance)")
-		let e = zip(i,ii).map { zip($0,$1).map { $0 - $1 } }
-		let okay = e.flatMap { $0 }.reduce(true) { $0 && $1.magnitude < tolerance }
-		let maxError = e.flatMap {$0}.reduce(T.Magnitude.zero) { max($0,$1.magnitude)}
-		print("maxError=\(maxError)")
-		let determinant = tridiagLU.determinant
-		print("determinate=\(determinant) vs. \(det)")
-		//XCTAssertTrue(determinant.isApproximatelyEqual(to: det))
-		// FIX 2: Replace `isApproximatelyEqual` with a magnitude check
-		let detError = (determinant - det).magnitude
-		// Use an absolute tolerance for determinant check
-		let detTolerance = T.Magnitude.ulpOfOne * 1000
-		
-		XCTAssertTrue(detError < detTolerance, "Determinant error \(detError) exceeds tolerance \(detTolerance)")
-		XCTAssertTrue(okay || tridiagLU.approximateConditionNumber.isInfinite )
-	}
 	/// Simple deterministic RNG for reproducible randomized tests.
 	struct DeterministicRNG {
 		private var state: UInt64

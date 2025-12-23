@@ -37,15 +37,12 @@ import Numerics
 	A.diagonal.withUnsafeBufferPointer { dPtr in
 		x.withUnsafeBufferPointer { xPtr in
 			y.withUnsafeMutableBufferPointer { yPtr in
-				
 				// y = d * x
 				T.vmul(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n )
-				
 				// y[0...n-2] += upper * x[1...n-1]
 				A.upper.withUnsafeBufferPointer { uPtr in
 					T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1 )
 				}
-				
 				// y[1...n-1] += lower * x[0...n-2]
 				A.lower.withUnsafeBufferPointer { lPtr in
 					T.vma( lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1 )
@@ -141,8 +138,8 @@ import Numerics
 	}
 }
 
-// MARK: - Tridiagonal Matrix-Vector Multiplication
-public func *<T: RealScalar>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
+// Real scalar optimized implementation
+@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
 	precondition(x.count == A.size, "Invalid column vector size")
 	let n = x.count
 	if n == 0 { return [] }
@@ -156,26 +153,25 @@ public func *<T: RealScalar>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) ->
 		result.withUnsafeMutableBufferPointer { resultPtr in
 			let xBase = xPtr.baseAddress!
 			let r = resultPtr.baseAddress!
-			// Diagonal contribution: result = diagonal * x
+			
 			A.diagonal.withUnsafeBufferPointer { dPtr in
 				T.vmul(dPtr.baseAddress!, 1, xBase, 1, r, 1, n)
 			}
-			// Upper diagonal: result[0..n-2] += upper * x[1..n-1]
 			A.upper.withUnsafeBufferPointer { uPtr in
 				T.vma(uPtr.baseAddress!, 1, xBase + 1, 1, r, 1, n-1)
 			}
-			// Lower diagonal: result[1..n-1] += lower * x[0..n-2]
 			A.lower.withUnsafeBufferPointer { lPtr in
 				T.vma(lPtr.baseAddress!, 1, xBase, 1, r + 1, 1, n-1)
 			}
 		}
-		
 	}
 	
 	return result
 }
 
-public func *<T: RealScalar >(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVector<Complex<T>>) -> ColumnVector<Complex<T>> {
+// Complex scalar optimized implementation
+@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVector<Complex<T>>
+) -> ColumnVector<Complex<T>> {
 	precondition(x.count == A.size, "Invalid column vector size")
 	let n = x.count
 	if n == 0 { return [] }
@@ -191,27 +187,21 @@ public func *<T: RealScalar >(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVec
 	
 	x.withUnsafeBufferPointer { xPtr in
 		result.withUnsafeMutableBufferPointer { resultPtr in
-			
 			let xBase = xPtr.baseAddress!
 			let resultBase = resultPtr.baseAddress!
 			
 			xBase.withMemoryRebound(to: T.self, capacity: 2*n) { x in
 				resultBase.withMemoryRebound(to: T.self, capacity: 2*n) { y in
-					
-					// --- DIAGONAL: result = diagonal * x ---
 					A.diagonal.withUnsafeBufferPointer { dPtr in
 						let dBase = dPtr.baseAddress!
 						dBase.withMemoryRebound(to: T.self, capacity: 2*n) { d in
-							// Real part: result.real = d.real * x.real - d.imag * x.imag
-							T.vmul(d, 1, x, 1, y, 1, 2*n) // Use stride-1 trick to get both products at once
-							T.vsub(y+1, 2, y, 2, y, 2, n) //result[even] = result[even] - result[odd]
-							// Imaginary part: result.imag = d.real * x.imag + d.imag * x.real
+							T.vmul(d, 1, x, 1, y, 1, 2*n)
+							T.vsub(y+1, 2, y, 2, y, 2, n)
 							T.vmul(d, 2, x+1, 2, y+1, 2, n)
 							T.vma(d+1, 2, x, 2, y+1, 2, n)
 						}
 					}
 					
-					// --- UPPER DIAGONAL: result[0..n-2] += upper * x[1..n-1] ---
 					A.upper.withUnsafeBufferPointer { uPtr in
 						let uBase = uPtr.baseAddress!
 						uBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { upper in
@@ -219,7 +209,6 @@ public func *<T: RealScalar >(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVec
 						}
 					}
 					
-					// --- LOWER DIAGONAL: result[1..n-1] += lower * x[0..n-2] ---
 					A.lower.withUnsafeBufferPointer { lPtr in
 						let lBase = lPtr.baseAddress!
 						lBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { lower in
@@ -232,3 +221,8 @@ public func *<T: RealScalar >(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVec
 	}
 	return result
 }
+
+// MARK: -  Tridiagonal Matrix-Vector Multiplication Operator using protocol dispatch
+@inlinable
+public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> { T.multiply(A, x) }
+

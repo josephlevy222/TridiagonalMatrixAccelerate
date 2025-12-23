@@ -55,6 +55,8 @@ public typealias DSPSignature<T> = (
 public typealias MultiplyAdd<T: ScalarField> =  ( _ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
 ) -> ColumnVector<T>
 
+public typealias MatrixVectorMultiply<T: ScalarField> = (_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T> ) -> ColumnVector<T>
+
 // MARK: - Real backend protocol (complex backends for real types)
 public protocol RealScalar: ScalarField & FloatingPoint & Real {
 	associatedtype WType
@@ -85,6 +87,7 @@ public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 	static var gtcon: gtcon<Self, Magnitude, CType> { get }
 	static var axpy:  axpy<Self>  { get }
 	static var AXpY: MultiplyAdd<Self> { get }
+	static var multiply: MatrixVectorMultiply<Self> { get } 
 }
 
 extension ScalarField {
@@ -148,6 +151,7 @@ extension Float: ScalarField, RealScalar {
 	public static var caxpy: axpy<WType> { makeAXPY(cblas_caxpy) }
 	public static var cAXpY: MultiplyAdd<Complex<Float>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Float> { AXpY_ }
+	public static var multiply: MatrixVectorMultiply<Float> { multiply_ }
 	
 }
 
@@ -170,6 +174,7 @@ extension Double: ScalarField, RealScalar {
 	public static var caxpy:  axpy<WType> { makeAXPY(cblas_zaxpy) }
 	public static var cAXpY: MultiplyAdd<Complex<Double>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Double> { AXpY_ }
+	public static var multiply: MatrixVectorMultiply<Double> { multiply_ }
 }
 
 extension Complex: ScalarField where RealType: RealScalar {
@@ -235,6 +240,7 @@ extension Complex: ScalarField where RealType: RealScalar {
 	}
 	
 	public static var AXpY: MultiplyAdd<Complex<RealType>> { AXpY_ }
+	public static var multiply: MatrixVectorMultiply<Complex<RealType>> { multiply_ }
 }
 
 // MARK: - Tridiagonal Matrix types
