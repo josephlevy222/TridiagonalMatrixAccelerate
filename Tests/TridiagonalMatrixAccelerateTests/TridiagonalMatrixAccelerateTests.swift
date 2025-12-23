@@ -81,19 +81,37 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 								  upper: [1.0, 1.0],
 								  lower: [-1.0, -1.0])
 		let x: [Double] = [1.0, 2.0, 3.0]
-		let y: [Double] = [100.0, 200.0, 300.0]
+		var y: [Double] = [100.0, 200.0, 300.0]
 		
 		// Expected calculation:
 		// A*x = [4.0, 8.0, 10.0] (from testMatrixVectorMultiply)
 		// A*x + y = [104.0, 208.0, 310.0]
 		
-		let result = AXpY(A: A, x: x, y: y)
+		let result = AXpY_(A,x,&y)
 		let expected: [Double] = [104.0, 208.0, 310.0]
 		
 		assertVectorsApproximatelyEqual(result, expected, tolerance: 1e-15)
 	}
 	
-	private func testExample<T : ScalarField >(_ d: T, det: T)  throws {
+	func testComplexAXpY() {
+		// Test with Complex<Double>
+		let A = TridiagonalMatrix(diagonal: [2.0, 3.0, 4.0].map { Complex<Double>($0, 0)},
+								  upper: [1.0, 1.0].map { Complex<Double>($0, 0)},
+								  lower: [-1.0, -1.0].map { Complex<Double>($0, 0)})
+		let x = [1.0, 2.0, 3.0].map { Complex<Double>($0, 0)}
+		var y = [100.0, 200.0, 300.0].map { Complex<Double>($0, 0)}
+		
+		// Expected calculation:
+		// A*x = [4.0, 8.0, 10.0] (from testMatrixVectorMultiply)
+		// A*x + y = [104.0, 208.0, 310.0]
+		
+		let result = AXpY_(A,x,&y)
+		let expected = [104.0, 208.0, 310.0].map { Complex<Double>($0, 0)}
+		
+		assertVectorsApproximatelyEqual(result, expected, tolerance: 1e-15)
+	}
+	
+	private func testExample<T : RealScalar >(_ d: T, det: T)  throws {
 		let one = T.one
 		let zero = T.zero
 		let lower = [one,one,one,one]
@@ -107,7 +125,8 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 				  [zero,zero,zero,one,zero],
 				  [zero,zero,zero,zero,one] ]
 		let x = i.map {icol in var b = icol; return  tridiagLU.solve(&b) }
-		let ii = x.map {xcol in tridiag*xcol}
+		let ii = x.map {xcol in tridiag * xcol}
+
 		var tolerance = T.Magnitude.ulpOfOne*2
 		let condition = tridiagLU.approximateConditionNumber
 		print("conditionNumber=\(condition)")
@@ -129,7 +148,42 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 		XCTAssertTrue(okay || tridiagLU.approximateConditionNumber.isInfinite )
 	}
 	
-	
+	private func testExample<T : RealScalar >(_ d: Complex<T>, det: Complex<T>)  throws {
+		let one = Complex<T>.one
+		let zero = Complex<T>.zero
+		let lower = [one,one,one,one]
+		let upper = lower
+		let diagonal = [d,d,d,d,d]
+		let tridiag = TridiagonalMatrix(diagonal: diagonal, upper: upper, lower: lower)
+		var tridiagLU =  TridiagonalLUMatrix(tridiag)
+		let i = [ [one,zero,zero,zero,zero],
+				  [zero,one,zero,zero,zero],
+				  [zero,zero,one,zero,zero],
+				  [zero,zero,zero,one,zero],
+				  [zero,zero,zero,zero,one] ]
+		let x = i.map {icol in var b = icol; return  tridiagLU.solve(&b) }
+		let ii = x.map {xcol in tridiag * xcol}
+		
+		var tolerance = T.Magnitude.ulpOfOne*2
+		let condition = tridiagLU.approximateConditionNumber
+		print("conditionNumber=\(condition)")
+		tolerance *= condition
+		print("tolerance=\(tolerance)")
+		let e = zip(i,ii).map { zip($0,$1).map { $0 - $1 } }
+		let okay = e.flatMap { $0 }.reduce(true) { $0 && $1.magnitude < tolerance }
+		let maxError = e.flatMap {$0}.reduce(T.Magnitude.zero) { max($0,$1.magnitude)}
+		print("maxError=\(maxError)")
+		let determinant = tridiagLU.determinant
+		print("determinate=\(determinant) vs. \(det)")
+		//XCTAssertTrue(determinant.isApproximatelyEqual(to: det))
+		// FIX 2: Replace `isApproximatelyEqual` with a magnitude check
+		let detError = (determinant - det).magnitude
+		// Use an absolute tolerance for determinant check
+		let detTolerance = T.Magnitude.ulpOfOne * 1000
+		
+		XCTAssertTrue(detError < detTolerance, "Determinant error \(detError) exceeds tolerance \(detTolerance)")
+		XCTAssertTrue(okay || tridiagLU.approximateConditionNumber.isInfinite )
+	}
 	/// Simple deterministic RNG for reproducible randomized tests.
 	struct DeterministicRNG {
 		private var state: UInt64
@@ -254,4 +308,121 @@ final class TridiagonalMatrixAccelerateTests: XCTestCase {
 			XCTAssertLessThanOrEqual(err, 1e-7 * max(1.0, lu.approximateConditionNumber))
 		}
 	}
+	
+	
+	// MARK: - Utilities
+	@inline(__always)
+	private func approxEqual(_ a: Double, _ b: Double, tol: Double = 1e-10) -> Bool {
+		abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+	}
+	
+	private func makeTestMatrix(n: Int) -> TridiagonalMatrix<Double> {
+		let d: [Double] = (0..<n).map { i in 4.0 + Double(i % 3) }
+		let du: [Double] = (0..<(n-1)).map { _ in 1.0 }
+		let dl: [Double] = (0..<(n-1)).map { _ in 1.0 }
+		return TridiagonalMatrix(diagonal: d, upper: du, lower: dl)
+	}
+	
+	// MARK: - Single RHS Solve
+	func testSingleRHSSolve() throws {
+		let n = 7
+		let A = makeTestMatrix(n: n)
+		var lu = A.factorized()
+		XCTAssertFalse(lu.isSingular)
+		
+		let xTrue: [Double] = (0..<n).map { i in Double(i) * 0.7 - 1.2 }
+		let b = A * xTrue
+		
+		var bCopy = b
+		let xSolved = lu.solve(&bCopy)
+		
+		for (xs, xt) in zip(xSolved, xTrue) {
+			XCTAssertTrue(approxEqual(xs, xt), "Expected \(xt), got \(xs)")
+		}
+	}
+	
+	// MARK: - Batched Solve via [[T]]
+	func testBatchedColumnsSolve() throws {
+		let n = 7
+		let nrhs = 3
+		let A = makeTestMatrix(n: n)
+		var lu = A.factorized()
+		XCTAssertFalse(lu.isSingular)
+		
+		let xBatch: [[Double]] = (0..<nrhs).map { j in
+			(0..<n).map { i in Double(i + j) * 0.3 + 0.1 }
+		}
+		
+		let bCols = xBatch.map { A * $0 }
+		let solvedCols = lu.solve(columns: bCols)
+		
+		for (solved, truth) in zip(solvedCols, xBatch) {
+			for (xs, xt) in zip(solved, truth) {
+				XCTAssertTrue(approxEqual(xs, xt), "Expected \(xt), got \(xs)")
+			}
+		}
+	}
+	
+	// MARK: - Batched Solve via Column-Major Flat Layout
+	func testBatchedFlatSolve() throws {
+		let n = 7
+		let nrhs = 3
+		let A = makeTestMatrix(n: n)
+		var lu = A.factorized()
+		XCTAssertFalse(lu.isSingular)
+		
+		let xBatch: [[Double]] = (0..<nrhs).map { j in
+			(0..<n).map { i in Double(i + j) * 0.3 + 0.1 }
+		}
+		
+		let bCols = xBatch.map { A * $0 }
+		
+		// Pack into column-major flat buffer
+		var bFlat = Array<Double>(repeating: 0.0, count: n * nrhs)
+		for j in 0..<nrhs {
+			for i in 0..<n {
+				bFlat[i + j*n] = bCols[j][i]
+			}
+		}
+		
+		var bFlatCopy = bFlat
+		let solvedFlat = lu.solve(&bFlatCopy, nrhs: nrhs)
+		
+		// Unpack and compare
+		for j in 0..<nrhs {
+			for i in 0..<n {
+				let xs = solvedFlat[i + j*n]
+				let xt = xBatch[j][i]
+				XCTAssertTrue(approxEqual(xs, xt), "Expected \(xt), got \(xs)")
+			}
+		}
+	}
+	
+	// MARK: - Transpose Solve
+	func testTransposeSolve() throws {
+		let n = 7
+		let A = makeTestMatrix(n: n)
+		var lu = A.factorized()
+		XCTAssertFalse(lu.isSingular)
+		
+		let xTrue: [Double] = (0..<n).map { i in Double(i) * 0.11 - 0.3 }
+		
+		// b = A^T * xTrue
+		var b = Array(repeating: 0.0, count: n)
+		b[0] = A.diagonal[0] * xTrue[0] + A.lower[0] * xTrue[1]
+		for i in 1..<(n-1) {
+			b[i] = A.upper[i-1] * xTrue[i-1]
+			+ A.diagonal[i] * xTrue[i]
+			+ A.lower[i] * xTrue[i+1]
+		}
+		b[n-1] = A.upper[n-2] * xTrue[n-2] + A.diagonal[n-1] * xTrue[n-1]
+		
+		var bCopy = b
+		let xSolved = lu.solve(&bCopy, transpose: true)
+		
+		for (xs, xt) in zip(xSolved, xTrue) {
+			XCTAssertTrue(approxEqual(xs, xt), "Expected \(xt), got \(xs)")
+		}
+	}
 }
+
