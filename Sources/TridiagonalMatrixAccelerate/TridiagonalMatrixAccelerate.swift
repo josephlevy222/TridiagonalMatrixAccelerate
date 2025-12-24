@@ -68,6 +68,7 @@ public protocol RealScalar: ScalarField & FloatingPoint & Real {
 	static var vmul: DSPSignature<Self> { get }
 	static var vsub: DSPSignature<Self> { get } //
 	static var cAXpY: MultiplyAdd<Complex<Self>> { get }
+	static var cMultiply: MatrixVectorMultiply<Complex<Self>> { get }
 }
 	
 // MARK: - Scalar field protocol used with LAPACK/BLAS
@@ -140,7 +141,7 @@ extension Float: ScalarField, RealScalar {
 	public static var cAXpY: MultiplyAdd<Complex<Float>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Float> { AXpY_ }
 	public static var multiply: MatrixVectorMultiply<Float> { multiply_ }
-	
+	public static var cMultiply: MatrixVectorMultiply<Complex<Float>> { multiply_ }
 }
 
 extension Double: ScalarField, RealScalar {
@@ -154,7 +155,6 @@ extension Double: ScalarField, RealScalar {
 		{ vDSP_vmulD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
 	public static var vsub: DSPSignature<Double> {
 		{ vDSP_vsubD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
-	
 	public typealias WType = __CLPK_doublecomplex
 	public static var cgttrf: gttrf<WType> { zgttrf_ }
 	public static var cgttrs: gttrs<WType> { zgttrs_ }
@@ -163,6 +163,7 @@ extension Double: ScalarField, RealScalar {
 	public static var cAXpY: MultiplyAdd<Complex<Double>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Double> { AXpY_ }
 	public static var multiply: MatrixVectorMultiply<Double> { multiply_ }
+	public static var cMultiply: MatrixVectorMultiply<Complex<Double>> { multiply_ }
 }
 
 extension Complex: ScalarField where RealType: RealScalar {
@@ -227,8 +228,8 @@ extension Complex: ScalarField where RealType: RealScalar {
 		}
 	}
 	
-	public static var AXpY: MultiplyAdd<Complex<RealType>> { AXpY_ }
-	public static var multiply: MatrixVectorMultiply<Complex<RealType>> { multiply_ }
+	public static var AXpY: MultiplyAdd<Complex<RealType>> { RealType.cAXpY }
+	public static var multiply: MatrixVectorMultiply<Complex<RealType>> { RealType.cMultiply }
 }
 
 // MARK: - Tridiagonal Matrix types
