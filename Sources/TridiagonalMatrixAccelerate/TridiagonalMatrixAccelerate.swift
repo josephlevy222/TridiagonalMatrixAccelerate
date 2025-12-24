@@ -68,16 +68,8 @@ public protocol RealScalar: ScalarField & FloatingPoint & Real {
 	static var vmul: DSPSignature<Self> { get }
 	static var vsub: DSPSignature<Self> { get } //
 	static var cAXpY: MultiplyAdd<Complex<Self>> { get }
-
-//	static var cAXpY: MultiplyAdd<Complex<Self>> { get }
 }
-
-extension RealScalar {
-	public var vma:  DSPSignature<Self> { { a, sa, b, sb, c, sc, n in for i in 0..<n { c[i*sc] += a[i*sa] + b[i+sb]} } }
-	public var vmul: DSPSignature<Self> { { a, sa, b, sb, c, sc, n in for i in 0..<n { c[i*sc] = a[i*sa] + b[i+sb] } } }
-	public var vsub: DSPSignature<Self> { { b, sb, a, sa, c, sc, n in for i in 0..<n { c[i*sc] = a[i*sa] - b[i+sb] } } }
-}
-		
+	
 // MARK: - Scalar field protocol used with LAPACK/BLAS
 public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 	associatedtype CType = Self
@@ -123,11 +115,7 @@ extension ScalarField {
 	static func makeAXPY<CType>(_ cFunction: @escaping (
 		_ N: Int32, _ a: CVoidPtr?, _ X: CVoidPtr?, _ incX: Int32, _ Y: CMutableVoidPtr?, _ incY: Int32) -> Void
 	) -> axpy<CType> {
-		{ n, a, x, incx, y, incy in
-			withUnsafePointer(to: a) { aptr in
-				cFunction(n, aptr, x, incx, y, incy)
-			}
-		}
+		{ n, a, x, incx, y, incy in withUnsafePointer(to: a) { aptr in cFunction(n, aptr, x, incx, y, incy) } }
 	}
 }
 
@@ -232,7 +220,7 @@ extension Complex: ScalarField where RealType: RealScalar {
 			d.withMemoryRebound(to: CType.self, capacity: n) { dC in
 				du.withMemoryRebound(to: CType.self, capacity: max(1, n-1)) { duC in
 					du2.withMemoryRebound(to: CType.self, capacity: max(0, n-2)) { du2C in
-						return body(dlC, dC, duC, du2C)
+						body(dlC, dC, duC, du2C)
 					}
 				}
 			}
@@ -317,18 +305,15 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 	public var determinant: T = 0
 	
 	@inline(__always) mutating func withMutableLUBufferPointers<R>(_ body: (
-		_ dl: CMutablePtr<T>, _ d: CMutablePtr<T>,
-		_ du: CMutablePtr<T>, _ du2: CMutablePtr<T>,
-		_ ipiv: CMutablePtr<CInt>) -> R) -> R {
+		_ dl: CMutablePtr<T>, _ d: CMutablePtr<T>,_ du: CMutablePtr<T>, _ du2: CMutablePtr<T>,_ ipiv: CMutablePtr<CInt>) -> R
+	) -> R {
 			lower.withUnsafeMutableBufferPointer { dlBuf in
 				diagonal.withUnsafeMutableBufferPointer { dBuf in
 					upper.withUnsafeMutableBufferPointer { duBuf in
 						upper2.withUnsafeMutableBufferPointer { du2Buf in
 							ipiv.withUnsafeMutableBufferPointer { ipivBuf in
-								guard let dlBase = dlBuf.baseAddress,
-									  let dBase  = dBuf.baseAddress,
-									  let duBase = duBuf.baseAddress,
-									  let du2Base = du2Buf.baseAddress,
+								guard let dlBase = dlBuf.baseAddress,  let dBase  = dBuf.baseAddress,
+									  let duBase = duBuf.baseAddress,  let du2Base = du2Buf.baseAddress,
 									  let ipivBase = ipivBuf.baseAddress
 								else { preconditionFailure("Unexpected nil base address") }
 								return body(dlBase, dBase, duBase, du2Base, ipivBase)
@@ -406,8 +391,8 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		var nrhs = CInt(1)
 		var ldb = n
 		var info = CInt(0)
-		let transChar: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) : Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
-		var trans = transChar
+		var trans: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) :
+											Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
 		b.withUnsafeMutableBufferPointer { buffer in
 			guard let bPtr = buffer.baseAddress else { preconditionFailure("Array base address is nil") }
 			withMutableLUBufferPointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
@@ -426,8 +411,8 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		var nrhs_c = CInt(nrhs)
 		var ldb = n
 		var info = CInt(0)
-		let transChar: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) : Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
-		var trans = transChar
+		var trans: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) :
+											Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
 		bColumnMajor.withUnsafeMutableBufferPointer { buf in
 			guard let bPtr = buf.baseAddress else { preconditionFailure("B base address is nil") }
 			withMutableLUBufferPointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
@@ -445,18 +430,31 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		precondition(columns.allSatisfy { $0.count == n }, "All columns must have length n")
 		
 		// Pack into column-major contiguous buffer
-		var bFlat = Array<T>(repeating: .zero, count: n * nrhs)
-		for j in 0..<nrhs {
-			let col = columns[j]
-			for i in 0..<n { bFlat[i + j*n] = col[i] }
+		var bFlat = [T](unsafeUninitializedCapacity: n * nrhs) { buffer, initializedCount in
+			var offset = 0
+			for col in columns {
+				col.withUnsafeBufferPointer { colPtr in
+					buffer.baseAddress!.advanced(by: offset).initialize(from: colPtr.baseAddress!, count: n)
+				}
+				offset += n
+			}
+			initializedCount = n * nrhs
 		}
 		
 		let solvedFlat = solve(&bFlat, nrhs: nrhs, transpose: transpose)
 		
 		// Unpack
-		var out: [[T]] = Array(repeating: Array(repeating: .zero, count: n), count: nrhs)
-		for j in 0..<nrhs {
-			for i in 0..<n { out[j][i] = solvedFlat[i + j*n] }
+		var out = [[T]]()
+		out.reserveCapacity(nrhs)
+		solvedFlat.withUnsafeBufferPointer { flatPtr in
+			for j in 0..<nrhs {
+				let start = j * n
+				let col = Array(unsafeUninitializedCapacity: n) { buffer, count in
+					buffer.baseAddress!.initialize(from: flatPtr.baseAddress! + start, count: n)
+					count = n
+				}
+				out.append(col)
+			}
 		}
 		return out
 	}
@@ -512,3 +510,162 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 	}
 }
 
+// MARK: - AXpY and * functions for protocols
+@inlinable public func AXpY_<T: RealScalar>( _ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
+) -> ColumnVector<T> {
+	let n = x.count
+	precondition(n == A.size)
+	
+	if n == 0 { return [] }
+	
+	if n == 1 {
+		y[0] = A.diagonal[0] * x[0]
+		return y
+	}
+	x.withUnsafeBufferPointer { xPtr in
+		y.withUnsafeMutableBufferPointer { yPtr in
+			// y = d * x
+			A.diagonal.withUnsafeBufferPointer { dPtr in
+				T.vma(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n )
+			}
+			// y[0...n-2] += upper * x[1...n-1]
+			A.upper.withUnsafeBufferPointer { uPtr in
+				T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1 )
+			}
+			// y[1...n-1] += lower * x[0...n-2]
+			A.lower.withUnsafeBufferPointer { lPtr in
+				T.vma( lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1 )
+			}
+			
+		}
+	}
+	return y
+}
+
+// Helper: Complex multiply-add for a band: y += band * x
+@inline(__always) public func complexVMA<T: RealScalar>(_ band: [Complex<T>],_ x: UnsafePointer<T>,_ y: CMutablePtr<T>,
+														   _ temp: CMutablePtr<T>,_ count: Int ) {
+	band.withUnsafeBufferPointer { bandPtr in
+		bandPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*count) { b in
+			T.vma(b, 2, x, 2, y, 2, count)          // y.real += b.real * x.real
+			T.vmul(b+1, 2, x+1, 2, temp, 1, count)  // temp   =  b.imag * x.imag
+			T.vsub(temp, 1, y, 2, y, 2, count)      // y.real =  y.real - temp
+			T.vma(b, 2, x+1, 2, y+1, 2, count)      // y.imag += b.real * x.imag
+			T.vma(b+1, 2, x, 2, y+1, 2, count)      // y.imag += b.imag * x.real
+		}
+	}
+}
+
+// Complex types versions
+@inlinable public func AXpY_<T: RealScalar>(
+	_ A: TridiagonalMatrix<Complex<T>>, _ x: [Complex<T>], _ y: inout [Complex<T>]
+) -> [Complex<T>] {
+	
+	let n = x.count
+	precondition(n == A.size)
+	precondition(y.count == n)
+	
+	if n == 0 { return y }
+	
+	if n == 1 {
+		y[0] = y[0] + A.diagonal[0] * x[0]
+		return y
+	}
+	
+	// We need temp of size of diagonal = n, but off-diagonals only use n-1
+	let tempSize = n  // For diagonal computations
+	
+	if tempSize <= 1024 {
+		// Small: Use stack for both
+		withUnsafeTemporaryAllocation(of: T.self, capacity: tempSize) { temp in
+			computeAXpYWithTemps(A, x: x, y: &y, temp: temp.baseAddress!)
+		}
+	} else {
+		// Large: Use heap
+		let diagTemp = UnsafeMutableBufferPointer<T>.allocate(capacity: tempSize)
+		defer { diagTemp.deallocate() }
+		computeAXpYWithTemps(A, x: x, y: &y, temp: diagTemp.baseAddress!)
+	}
+	return y
+}
+
+// Version that reuses same temp array for both diagonal and off-diagonal
+@inlinable internal func computeAXpYWithTemps<T: RealScalar>(
+	_ A: TridiagonalMatrix<Complex<T>>, x: [Complex<T>], y: inout [Complex<T>],  temp: UnsafeMutablePointer<T>
+) {
+	let n = x.count
+	
+	x.withUnsafeBufferPointer { xPtr in
+		y.withUnsafeMutableBufferPointer { yPtr in
+			xPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*n) { x in
+				yPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*n) { y in
+					complexVMA(A.diagonal, x, y, temp, n)
+					complexVMA(A.upper, x+2, y, temp, n-1)
+					complexVMA(A.lower, x, y+2, temp, n-1)
+				}
+			}
+			
+		}
+	}
+}
+
+// Real scalar optimized implementation
+@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
+	precondition(x.count == A.size, "Invalid column vector size")
+	let n = x.count
+	if n == 0 { return [] }
+	if n == 1 { return [A.diagonal[0] * x[0]] }
+	
+	var result = [T](unsafeUninitializedCapacity: n) { buffer, initializedCount in
+		initializedCount = n
+	}
+	
+	x.withUnsafeBufferPointer { xPtr in
+		result.withUnsafeMutableBufferPointer { resultPtr in
+			let xBase = xPtr.baseAddress!
+			let r = resultPtr.baseAddress!
+			A.diagonal.withUnsafeBufferPointer { dPtr in T.vmul(dPtr.baseAddress!, 1, xBase, 1, r, 1, n) }
+			A.upper.withUnsafeBufferPointer { uPtr in T.vma(uPtr.baseAddress!, 1, xBase + 1, 1, r, 1, n-1) }
+			A.lower.withUnsafeBufferPointer { lPtr in T.vma(lPtr.baseAddress!, 1, xBase, 1, r + 1, 1, n-1) }
+		}
+	}
+	
+	return result
+}
+
+// Complex scalar optimized implementation
+@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVector<Complex<T>>
+) -> ColumnVector<Complex<T>> {
+	precondition(x.count == A.size, "Invalid column vector size")
+	let n = x.count
+	if n == 0 { return [] }
+	if n == 1 { return [A.diagonal[0] * x[0]] }
+	
+	var result = [Complex<T>](unsafeUninitializedCapacity: n) { buffer, initializedCount in initializedCount = n }
+	
+	var temp = [T](unsafeUninitializedCapacity: n) { buffer, initializedCount in initializedCount = n }
+	
+	x.withUnsafeBufferPointer { xPtr in
+		result.withUnsafeMutableBufferPointer { resultPtr in
+			xPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*n) { x in
+				resultPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*n) { y in
+					A.diagonal.withUnsafeBufferPointer { dPtr in
+						dPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*n) { d in
+							T.vmul(d, 1, x, 1, y, 1, 2*n)  // y.real = d.real*x.real ; y.imag = d.imag*x.imag
+							T.vsub(y+1, 2, y, 2, y, 2, n)  // y.real = y.real - y.imag
+							T.vmul(d, 2, x+1, 2, y+1, 2, n)// y.imag = d.real*x.imag
+							T.vma(d+1, 2, x, 2, y+1, 2, n) // y.imag += d.imag*x.real
+						}
+					}
+					complexVMA(A.upper, x+2, y, &temp, n-1)
+					complexVMA(A.lower, x, y+2, &temp, n-1)
+				}
+			}
+		}
+	}
+	return result
+}
+
+// MARK: -  Tridiagonal Matrix-Vector Multiplication Operator using protocol dispatch
+@inlinable
+public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> { T.multiply(A, x) }
