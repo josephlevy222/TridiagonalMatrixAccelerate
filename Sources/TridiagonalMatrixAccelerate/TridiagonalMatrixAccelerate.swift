@@ -11,7 +11,7 @@
 //  - Removed custom ContiguousStorage protocol (use standard buffer APIs)
 //  - Minor naming clarifications and inlining for hot paths
 //  - Added: solve(transpose:), batched RHS solves, and more self-contained tests
-//
+//  - DSP code for matrix vector multiply and matrix vector multiply add A*x and AXpY
 
 import Accelerate
 import Numerics
@@ -163,7 +163,7 @@ extension Double: ScalarField, RealScalar {
 	public static var vma: DSPSignature<Double> {
 		{ vDSP_vmaD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5),  $4, vDSP_Stride($5), vDSP_Length($6)) } }
 	public static var vmul: DSPSignature<Double> {
-		{ vDSP_vmaD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5),  $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vmulD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
 	public static var vsub: DSPSignature<Double> {
 		{ vDSP_vsubD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
 	
@@ -282,35 +282,6 @@ extension Complex: ScalarField where RealType: RealScalar {
 public typealias ColumnVector<T: ScalarField> = Array<T>
 
 // MARK: - Basic matrix-vector ops
-//public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
-//	precondition(x.count == A.size, "Invalid column vector size")
-//	let n = x.count
-//	if n == 0 { return [] }
-//	if n == 1 { return [A.diagonal[0] * x[0]] }
-//	
-//	var b = Array<T>(repeating: .zero, count: n)
-//	b[0] = A.diagonal[0] * x[0] + A.upper[0] * x[1]
-//	for j in 1..<(n-1) {
-//		b[j] = A.lower[j-1] * x[j-1] + A.diagonal[j] * x[j] + A.upper[j] * x[j+1]
-//	}
-//	b[n-1] = A.lower[n-2] * x[n-2] + A.diagonal[n-1] * x[n-1]
-//	return b
-//}
-
-public func oldAXpY<T: ScalarField>(A: TridiagonalMatrix<T>, x: ColumnVector<T>, y: inout ColumnVector<T>) -> ColumnVector<T> {
-	precondition(x.count == A.size && y.count == A.size, "Vector sizes must match")
-	let n = x.count
-	if n == 0 { return [] }
-	if n == 1 { return [y[0] + A.diagonal[0] * x[0]] }
-	
-	var b = y
-	b[0] += A.diagonal[0] * x[0] + A.upper[0] * x[1]
-	for j in 1..<(n-1) {
-		b[j] += A.lower[j-1] * x[j-1] + A.diagonal[j] * x[j] + A.upper[j] * x[j+1]
-	}
-	b[n-1] += A.lower[n-2] * x[n-2] + A.diagonal[n-1] * x[n-1]
-	return b
-}
 
 public func aXpY_Inplace<T: ScalarField>(a: T, x: ColumnVector<T>, y: inout ColumnVector<T>) {
 	precondition(x.count == y.count, "Vector size mismatch")

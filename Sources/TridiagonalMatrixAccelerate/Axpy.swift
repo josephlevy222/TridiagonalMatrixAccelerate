@@ -5,21 +5,6 @@
 //  Created by Joseph Levy on 12/3/25.
 //
 import Accelerate
-public func originalAXpY<T: ScalarField>(A: TridiagonalMatrix<T>, x: ColumnVector<T>, y: ColumnVector<T>) -> ColumnVector<T> {
-	precondition(x.count == A.size && y.count == A.size, "Vector sizes must match")
-	let n = x.count
-	if n == 0 { return [] }
-	if n == 1 { return [y[0] + A.diagonal[0] * x[0]] }
-	
-	var b = y
-	b[0] += A.diagonal[0] * x[0] + A.upper[0] * x[1]
-	for j in 1..<(n-1) {
-		b[j] += A.lower[j-1] * x[j-1] + A.diagonal[j] * x[j] + A.upper[j] * x[j+1]
-	}
-	b[n-1] += A.lower[n-2] * x[n-2] + A.diagonal[n-1] * x[n-1]
-	return b
-}
-
 import Numerics
 
 @inlinable public func AXpY_<T: RealScalar>( _ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
@@ -33,34 +18,39 @@ import Numerics
 		y[0] = A.diagonal[0] * x[0]
 		return y
 	}
-	
-	A.diagonal.withUnsafeBufferPointer { dPtr in
-		x.withUnsafeBufferPointer { xPtr in
-			y.withUnsafeMutableBufferPointer { yPtr in
-				// y = d * x
-				T.vmul(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n )
-				// y[0...n-2] += upper * x[1...n-1]
-				A.upper.withUnsafeBufferPointer { uPtr in
-					T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1 )
-				}
-				// y[1...n-1] += lower * x[0...n-2]
-				A.lower.withUnsafeBufferPointer { lPtr in
-					T.vma( lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1 )
-				}
+	x.withUnsafeBufferPointer { xPtr in
+		y.withUnsafeMutableBufferPointer { yPtr in
+			// y = d * x
+			A.diagonal.withUnsafeBufferPointer { dPtr in
+				T.vma(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n )
 			}
+			// y[0...n-2] += upper * x[1...n-1]
+			A.upper.withUnsafeBufferPointer { uPtr in
+				T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1 )
+			}
+			// y[1...n-1] += lower * x[0...n-2]
+			A.lower.withUnsafeBufferPointer { lPtr in
+				T.vma( lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1 )
+			}
+			
 		}
 	}
 	return y
 }
 
 /// Helper: Complex multiply-add for a band: y += band * x
-@inline(__always) public func complexBandMA<T: RealScalar>(
-	_ band: UnsafePointer<T>, _ x: UnsafePointer<T>, _ y: CMutablePtr<T>, _ temp: CMutablePtr<T>, _ count: Int) {
-	T.vma(band, 2, x, 2, y, 2, count)          // y.real += d.real * x.real
-	T.vmul(band+1, 2, x+1, 2, temp, 1, count)  // y.real += d.real * x.real
-	T.vsub(temp, 1, y, 2, y, 2, count)         // y.real = y.real - temp
-	T.vma(band, 2, x+1, 2, y+1, 2, count)      // y.imag += d.real * x.imag
-	T.vma(band+1, 2, x, 2, y+1, 2, count)      // y.imag += d.imag * x.real
+@inline(__always) public func complexBandMA<T: RealScalar>(_ band: [Complex<T>],_ x: UnsafePointer<T>,_ y: CMutablePtr<T>,
+														   _ temp: CMutablePtr<T>,_ count: Int ) {
+	band.withUnsafeBufferPointer { bandPtr in
+		let bandBase = bandPtr.baseAddress!
+		bandBase.withMemoryRebound(to: T.self, capacity: 2*count) { b in
+			T.vma(b, 2, x, 2, y, 2, count)          // y.real += d.real * x.real
+			T.vmul(b+1, 2, x+1, 2, temp, 1, count)  // y.real += d.real * x.imag
+			T.vsub(temp, 1, y, 2, y, 2, count)      // y.real = y.real - temp
+			T.vma(b, 2, x+1, 2, y+1, 2, count)      // y.imag += d.real * x.imag
+			T.vma(b+1, 2, x, 2, y+1, 2, count)      // y.imag += d.imag * x.real
+		}
+	}
 }
 
 @inlinable public func AXpY_<T: RealScalar>(
@@ -110,27 +100,11 @@ import Numerics
 			xBase.withMemoryRebound(to: T.self, capacity: 2*n) { x in
 				yBase.withMemoryRebound(to: T.self, capacity: 2*n) { y in
 					// --- DIAGONAL ---
-					A.diagonal.withUnsafeBufferPointer { dPtr in
-						let dBase = dPtr.baseAddress!
-						dBase.withMemoryRebound(to: T.self, capacity: 2*n) { d in
-							complexBandMA(d, x, y, diagTemp, n)
-						}
-					}
+					complexBandMA(A.diagonal, x, y, diagTemp, n)
 					// --- UPPER DIAGONAL ---
-					A.upper.withUnsafeBufferPointer { uPtr in
-						let uBase = uPtr.baseAddress!
-						uBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { upper in
-							complexBandMA(upper, x+2, y, diagTemp, n-1)
-						}
-					}
-					
+					complexBandMA(A.upper, x+2, y, diagTemp, n-1)
 					// --- LOWER DIAGONAL ---
-					A.lower.withUnsafeBufferPointer { lPtr in
-						let lBase = lPtr.baseAddress!
-						lBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { lower in
-							complexBandMA(lower, x, y+2, diagTemp, n-1)
-						}
-					}
+					complexBandMA(A.lower, x, y+2, diagTemp, n-1)
 				}
 			}
 			
@@ -201,20 +175,8 @@ import Numerics
 							T.vma(d+1, 2, x, 2, y+1, 2, n)
 						}
 					}
-					
-					A.upper.withUnsafeBufferPointer { uPtr in
-						let uBase = uPtr.baseAddress!
-						uBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { upper in
-							complexBandMA(upper, x+2, y, &temp, n-1)
-						}
-					}
-					
-					A.lower.withUnsafeBufferPointer { lPtr in
-						let lBase = lPtr.baseAddress!
-						lBase.withMemoryRebound(to: T.self, capacity: 2*(n-1)) { lower in
-							complexBandMA(lower, x, y+2, &temp, n-1)
-						}
-					}
+					complexBandMA(A.upper, x+2, y, &temp, n-1)
+					complexBandMA(A.lower, x, y+2, &temp, n-1)
 				}
 			}
 		}
