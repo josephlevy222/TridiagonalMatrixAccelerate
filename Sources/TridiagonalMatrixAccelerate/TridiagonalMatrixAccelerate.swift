@@ -2,27 +2,18 @@
 //  TridiagonalMatrixAccelerate.swift
 //  TridiagonalMatrix
 //
-//  Cleaned, corrected, and compacted version
-//  Changes:
-//  - Correct determinant parity via cycle decomposition
-//  - Safer workspace ownership (reference held as `let`)
-//  - Fix iwork allocation logic (real types need iwork)
-//  - Defensive preconditions in `reboundBands`
-//  - Removed custom ContiguousStorage protocol (use standard buffer APIs)
-//  - Minor naming clarifications and inlining for hot paths
-//  - Added: solve(transpose:), batched RHS solves, and more self-contained tests
-//  - DSP code for matrix vector multiply and matrix vector multiply add A*x and AXpY
+//  Unified dispatch pattern with consistent overloading throughout
 
 import Accelerate
 import Numerics
 
-// short aliases
+// MARK: - Type Aliases
 public typealias CInt = __CLPK_integer
 public typealias CMutablePtr = UnsafeMutablePointer
 public typealias CVoidPtr = UnsafeRawPointer
 public typealias CMutableVoidPtr = UnsafeMutableRawPointer
 
-// MARK: - LAPACK/BLAS C function typealiases
+// MARK: - LAPACK/BLAS C Function Typealiases
 public typealias gttrf<T> = (
 	_ N: CMutablePtr<CInt>?, _ DL: CMutablePtr<T>?, _ D: CMutablePtr<T>?, _ DU: CMutablePtr<T>?, _ DU2: CMutablePtr<T>?,
 	_ IPIV: CMutablePtr<CInt>?, _ INFO: CMutablePtr<CInt>?
@@ -52,26 +43,91 @@ public typealias axpy<T> = (
 public typealias DSPSignature<T> = (
 	_ a: UnsafePointer<T>, _ sa: Int, _ b: UnsafePointer<T>, _ sb: Int, _ c: CMutablePtr<T>, _ sc: Int, _ n: Int) -> Void
 
-public typealias MultiplyAdd<T: ScalarField> =  ( _ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
+public typealias MultiplyAdd<T: ScalarField> = (
+	_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
 ) -> ColumnVector<T>
 
-public typealias MatrixVectorMultiply<T: ScalarField> = (_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T> ) -> ColumnVector<T>
+public typealias MatrixVectorMultiply<T: ScalarField> = (
+	_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>
+) -> ColumnVector<T>
 
-// MARK: - Real backend protocol (complex backends for real types)
+// MARK: - Wrapper Functions for C API Differences
+
+// Real GTCON wrapper - handles iwork allocation
+@inlinable public func gtcon_<T, R>(
+	_ cFunction: @escaping gtcon<T, R, T>,
+	_ norm: CMutablePtr<Int8>?, _ n: CMutablePtr<CInt>?,
+	_ dl: CMutablePtr<T>?, _ d: CMutablePtr<T>?, _ du: CMutablePtr<T>?, _ du2: CMutablePtr<T>?,
+	_ ipiv: CMutablePtr<CInt>?, _ anorm: CMutablePtr<R>?, _ rcond: CMutablePtr<R>?,
+	_ work: CMutablePtr<T>?, _ iwork: CMutablePtr<CInt>?, _ info: CMutablePtr<CInt>?
+) -> CInt {
+	if let iwork {
+		return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
+	} else {
+		let nn = max(1, Int(n!.pointee))
+		return withUnsafeTemporaryAllocation(of: CInt.self, capacity: nn) { tempI in
+			return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, tempI.baseAddress!, info)
+		}
+	}
+}
+
+// Complex GTCON wrapper - handles work allocation (ignores iwork)
+@inlinable public func gtcon_<T, R>(
+	_ cFunction: @escaping gtconComplex<T, R, T>,
+	_ norm: CMutablePtr<Int8>?, _ n: CMutablePtr<CInt>?,
+	_ dl: CMutablePtr<T>?, _ d: CMutablePtr<T>?, _ du: CMutablePtr<T>?, _ du2: CMutablePtr<T>?,
+	_ ipiv: CMutablePtr<CInt>?, _ anorm: CMutablePtr<R>?, _ rcond: CMutablePtr<R>?,
+	_ work: CMutablePtr<T>?, _ iwork: CMutablePtr<CInt>?, _ info: CMutablePtr<CInt>?
+) -> CInt {
+	if let work {
+		return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, info)
+	} else {
+		let nn = max(1, Int(n!.pointee) * 2)
+		return withUnsafeTemporaryAllocation(of: T.self, capacity: nn) { tmp in
+			return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, tmp.baseAddress!, info)
+		}
+	}
+}
+
+// AXPY wrapper for complex types (void pointer conversion)
+@inlinable public func axpy_<CType>(
+	_ cFunction: @escaping (
+		_ N: Int32, _ a: CVoidPtr?, _ X: CVoidPtr?, _ incX: Int32, _ Y: CMutableVoidPtr?, _ incY: Int32
+	) -> Void,
+	_ n: Int32, _ a: CType, _ x: UnsafePointer<CType>, _ incx: Int32,
+	_ y: CMutablePtr<CType>, _ incy: Int32
+) {
+	withUnsafePointer(to: a) { aptr in
+		cFunction(n, aptr, x, incx, y, incy)
+	}
+}
+
+// Direct AXPY for real types (no wrapper needed)
+@inlinable public func axpy_<T>(
+	_ cFunction: @escaping axpy<T>,
+	_ n: Int32, _ a: T, _ x: UnsafePointer<T>, _ incx: Int32,
+	_ y: CMutablePtr<T>, _ incy: Int32
+) {
+	cFunction(n, a, x, incx, y, incy)
+}
+
+// MARK: - Scalar Field Protocols
+
+// Real backend protocol (for complex types)
 public protocol RealScalar: ScalarField & FloatingPoint & Real {
 	associatedtype WType
 	static var cgttrf: gttrf<WType> { get }
 	static var cgttrs: gttrs<WType> { get }
 	static var cgtcon: gtcon<WType, Self, WType> { get }
 	static var caxpy: axpy<WType> { get }
-	static var vma:  DSPSignature<Self> { get } // Since c and d are alway the same in this code, d is left off
+	static var vma:  DSPSignature<Self> { get }
 	static var vmul: DSPSignature<Self> { get }
-	static var vsub: DSPSignature<Self> { get } //
+	static var vsub: DSPSignature<Self> { get }
 	static var cAXpY: MultiplyAdd<Complex<Self>> { get }
 	static var cMultiply: MatrixVectorMultiply<Complex<Self>> { get }
 }
-	
-// MARK: - Scalar field protocol used with LAPACK/BLAS
+
+// Main scalar field protocol
 public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 	associatedtype CType = Self
 	static var one: Self { get }
@@ -80,92 +136,116 @@ public protocol ScalarField: AlgebraicField where Magnitude: FloatingPoint {
 	static var gtcon: gtcon<Self, Magnitude, CType> { get }
 	static var axpy:  axpy<Self>  { get }
 	static var AXpY: MultiplyAdd<Self> { get }
-	static var multiply: MatrixVectorMultiply<Self> { get } 
+	static var multiply: MatrixVectorMultiply<Self> { get }
 }
 
 extension ScalarField {
 	public static var one: Self { 1 }
-	
-	// helpers to adapt LAPACK signatures that differ for complex real backends
-	static func makeRealGTCON<T, R>(_ cFunction: @escaping gtcon<T, R, T>) -> gtcon<T, R, T> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
-			if let iwork {
-				return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
-			} else {
-				let nn = max(1, Int(n!.pointee))
-				return withUnsafeTemporaryAllocation(of: CInt.self, capacity: nn) { tempI in
-					return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, tempI.baseAddress!, info)
-				}
-			}
-		}
-	}
-	
-	static func makeComplexGTCON<T, R>(_ cFunction: @escaping gtconComplex<T, R, T>) -> gtcon<T, R, T> {
-		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, unused, info in
-			if let work {
-				return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, info)
-			} else {
-				let nn = max(1, Int(n!.pointee) * 2)
-				return withUnsafeTemporaryAllocation(of: T.self, capacity: nn) { tmp in
-					return cFunction(norm, n, dl, d, du, du2, ipiv, anorm, rcond, tmp.baseAddress!, info)
-				}
-			}
-		}
-	}
-	
-	static func makeAXPY<CType>(_ cFunction: @escaping (
-		_ N: Int32, _ a: CVoidPtr?, _ X: CVoidPtr?, _ incX: Int32, _ Y: CMutableVoidPtr?, _ incY: Int32) -> Void
-	) -> axpy<CType> {
-		{ n, a, x, incx, y, incy in withUnsafePointer(to: a) { aptr in cFunction(n, aptr, x, incx, y, incy) } }
-	}
 }
 
-// MARK: - Float / Double / Complex bindings
+// MARK: - Float Implementation
 extension Float: ScalarField, RealScalar {
 	public static var gttrf: gttrf<Float> { sgttrf_ }
 	public static var gttrs: gttrs<Float> { sgttrs_ }
-	public static var gtcon: gtcon<Float,Float,Float> { makeRealGTCON(sgtcon_) }
-	public static var axpy:  axpy<Float> { cblas_saxpy }
-	public static var vma: DSPSignature<Float> {//A   B                    C                     D
-		{ vDSP_vma($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5),  $4, vDSP_Stride($5), vDSP_Length($6)) } }
+	
+	public static var gtcon: gtcon<Float, Float, Float> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
+			gtcon_(sgtcon_, norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
+		}
+	}
+	
+	public static var axpy: axpy<Float> {
+		{ n, a, x, incx, y, incy in
+			axpy_(cblas_saxpy, n, a, x, incx, y, incy)
+		}
+	}
+	
+	public static var vma: DSPSignature<Float> {
+		{ vDSP_vma($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
+	
 	public static var vmul: DSPSignature<Float> {
-		{ vDSP_vmul($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vmul($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
+	
 	public static var vsub: DSPSignature<Float> {
-		{ vDSP_vsub($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vsub($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
 	
 	public typealias WType = __CLPK_complex
 	public static var cgttrf: gttrf<WType> { cgttrf_ }
 	public static var cgttrs: gttrs<WType> { cgttrs_ }
-	public static var cgtcon: gtcon<WType, Float, WType> { makeComplexGTCON(cgtcon_) }
-	public static var caxpy: axpy<WType> { makeAXPY(cblas_caxpy) }
+	
+	public static var cgtcon: gtcon<WType, Float, WType> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
+			gtcon_(cgtcon_, norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
+		}
+	}
+	
+	public static var caxpy: axpy<WType> {
+		{ n, a, x, incx, y, incy in
+			axpy_(cblas_caxpy, n, a, x, incx, y, incy)
+		}
+	}
+	
 	public static var cAXpY: MultiplyAdd<Complex<Float>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Float> { AXpY_ }
-	public static var multiply: MatrixVectorMultiply<Float> { multiply_ }
 	public static var cMultiply: MatrixVectorMultiply<Complex<Float>> { multiply_ }
+	public static var multiply: MatrixVectorMultiply<Float> { multiply_ }
 }
 
+// MARK: - Double Implementation
 extension Double: ScalarField, RealScalar {
 	public static var gttrf: gttrf<Double> { dgttrf_ }
 	public static var gttrs: gttrs<Double> { dgttrs_ }
-	public static var gtcon: gtcon<Double,Double,Double> { makeRealGTCON(dgtcon_) }
-	public static var axpy:  axpy<Double> { cblas_daxpy }
+	
+	public static var gtcon: gtcon<Double, Double, Double> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
+			gtcon_(dgtcon_, norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
+		}
+	}
+	
+	public static var axpy: axpy<Double> {
+		{ n, a, x, incx, y, incy in
+			axpy_(cblas_daxpy, n, a, x, incx, y, incy)
+		}
+	}
+	
 	public static var vma: DSPSignature<Double> {
-		{ vDSP_vmaD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5),  $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vmaD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
+	
 	public static var vmul: DSPSignature<Double> {
-		{ vDSP_vmulD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vmulD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
+	
 	public static var vsub: DSPSignature<Double> {
-		{ vDSP_vsubD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) } }
+		{ vDSP_vsubD($0, vDSP_Stride($1), $2, vDSP_Stride($3), $4, vDSP_Stride($5), vDSP_Length($6)) }
+	}
+	
 	public typealias WType = __CLPK_doublecomplex
 	public static var cgttrf: gttrf<WType> { zgttrf_ }
 	public static var cgttrs: gttrs<WType> { zgttrs_ }
-	public static var cgtcon: gtcon<WType, Double, WType> { makeComplexGTCON(zgtcon_) }
-	public static var caxpy:  axpy<WType> { makeAXPY(cblas_zaxpy) }
+	
+	public static var cgtcon: gtcon<WType, Double, WType> {
+		{ norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info in
+			gtcon_(zgtcon_, norm, n, dl, d, du, du2, ipiv, anorm, rcond, work, iwork, info)
+		}
+	}
+	
+	public static var caxpy: axpy<WType> {
+		{ n, a, x, incx, y, incy in
+			axpy_(cblas_zaxpy, n, a, x, incx, y, incy)
+		}
+	}
+	
 	public static var cAXpY: MultiplyAdd<Complex<Double>> { AXpY_ }
 	public static var AXpY: MultiplyAdd<Double> { AXpY_ }
-	public static var multiply: MatrixVectorMultiply<Double> { multiply_ }
 	public static var cMultiply: MatrixVectorMultiply<Complex<Double>> { multiply_ }
+	public static var multiply: MatrixVectorMultiply<Double> { multiply_ }
 }
 
+// MARK: - Complex Implementation
 extension Complex: ScalarField where RealType: RealScalar {
 	public typealias CType = RealType.WType
 	
@@ -232,7 +312,7 @@ extension Complex: ScalarField where RealType: RealScalar {
 	public static var multiply: MatrixVectorMultiply<Complex<RealType>> { RealType.cMultiply }
 }
 
-// MARK: - Tridiagonal Matrix types
+// MARK: - Tridiagonal Matrix Type
 @frozen public struct TridiagonalMatrix<T: ScalarField> {
 	public var lower: [T]
 	public var diagonal: [T]
@@ -270,7 +350,7 @@ extension Complex: ScalarField where RealType: RealScalar {
 
 public typealias ColumnVector<T: ScalarField> = Array<T>
 
-// MARK: - Basic matrix-vector ops
+// MARK: - Basic Matrix-Vector Operations
 
 public func aXpY_Inplace<T: ScalarField>(a: T, x: ColumnVector<T>, y: inout ColumnVector<T>) {
 	precondition(x.count == y.count, "Vector size mismatch")
@@ -306,24 +386,24 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 	public var determinant: T = 0
 	
 	@inline(__always) mutating func withMutableLUBufferPointers<R>(_ body: (
-		_ dl: CMutablePtr<T>, _ d: CMutablePtr<T>,_ du: CMutablePtr<T>, _ du2: CMutablePtr<T>,_ ipiv: CMutablePtr<CInt>) -> R
-	) -> R {
-			lower.withUnsafeMutableBufferPointer { dlBuf in
-				diagonal.withUnsafeMutableBufferPointer { dBuf in
-					upper.withUnsafeMutableBufferPointer { duBuf in
-						upper2.withUnsafeMutableBufferPointer { du2Buf in
-							ipiv.withUnsafeMutableBufferPointer { ipivBuf in
-								guard let dlBase = dlBuf.baseAddress,  let dBase  = dBuf.baseAddress,
-									  let duBase = duBuf.baseAddress,  let du2Base = du2Buf.baseAddress,
-									  let ipivBase = ipivBuf.baseAddress
-								else { preconditionFailure("Unexpected nil base address") }
-								return body(dlBase, dBase, duBase, du2Base, ipivBase)
-							}
+		_ dl: CMutablePtr<T>, _ d: CMutablePtr<T>, _ du: CMutablePtr<T>, _ du2: CMutablePtr<T>, _ ipiv: CMutablePtr<CInt>
+	) -> R) -> R {
+		lower.withUnsafeMutableBufferPointer { dlBuf in
+			diagonal.withUnsafeMutableBufferPointer { dBuf in
+				upper.withUnsafeMutableBufferPointer { duBuf in
+					upper2.withUnsafeMutableBufferPointer { du2Buf in
+						ipiv.withUnsafeMutableBufferPointer { ipivBuf in
+							guard let dlBase = dlBuf.baseAddress, let dBase = dBuf.baseAddress,
+								  let duBase = duBuf.baseAddress, let du2Base = du2Buf.baseAddress,
+								  let ipivBase = ipivBuf.baseAddress
+							else { preconditionFailure("Unexpected nil base address") }
+							return body(dlBase, dBase, duBase, du2Base, ipivBase)
 						}
 					}
 				}
 			}
 		}
+	}
 	
 	public init(_ A: TridiagonalMatrix<T>) {
 		self.init(dl: A.lower, d: A.diagonal, du: A.upper, anorm: A.oneNorm())
@@ -347,14 +427,14 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		var n_ = CInt(d.count)
 		var info = CInt(0)
 		
-		// factor
+		// Factor
 		withMutableLUBufferPointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
 			_ = T.gttrf(&n_, dlPtr, dPtr, duPtr, du2Ptr, ipivPtr, &info)
 		}
 		if info != 0 { return }
 		isSingular = false
 		
-		// determinant: compute product of diagonal (U diagonal) and permutation parity by cycle decomposition
+		// Determinant: compute product of diagonal (U diagonal) and permutation parity by cycle decomposition
 		let detU = diagonal.reduce(T.one, *)
 		let n = count
 		var seen = Array(repeating: false, count: n)
@@ -371,7 +451,7 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		let parityIsNegative = ((n - cycles) % 2) != 0
 		determinant = parityIsNegative ? -detU : detU
 		
-		// condition estimate (gtcon)
+		// Condition estimate (gtcon)
 		var anorm_ = anorm
 		var rcond_ = T.Magnitude(0)
 		var normChar: Int8 = Int8(UnicodeScalar("O").value)
@@ -393,7 +473,7 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		var ldb = n
 		var info = CInt(0)
 		var trans: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) :
-											Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
+										Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
 		b.withUnsafeMutableBufferPointer { buffer in
 			guard let bPtr = buffer.baseAddress else { preconditionFailure("Array base address is nil") }
 			withMutableLUBufferPointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
@@ -413,7 +493,7 @@ public func aXpY<T: ScalarField>(a: T, x: ColumnVector<T>, y: ColumnVector<T>) -
 		var ldb = n
 		var info = CInt(0)
 		var trans: Int8 = transpose ? (T.self is (any RealScalar.Type) ? Int8(UnicodeScalar("T").value) :
-											Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
+										Int8(UnicodeScalar("C").value)) : Int8(UnicodeScalar("N").value)
 		bColumnMajor.withUnsafeMutableBufferPointer { buf in
 			guard let bPtr = buf.baseAddress else { preconditionFailure("B base address is nil") }
 			withMutableLUBufferPointers { dlPtr, dPtr, duPtr, du2Ptr, ipivPtr in
@@ -511,41 +591,47 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 	}
 }
 
-// MARK: - AXpY and * functions for protocols
-@inlinable public func AXpY_<T: RealScalar>( _ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
+// MARK: - AXpY Implementation Functions
+
+// Real scalar optimized implementation
+@inlinable public func AXpY_<T: RealScalar>(
+	_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>, _ y: inout ColumnVector<T>
 ) -> ColumnVector<T> {
 	let n = x.count
 	precondition(n == A.size)
+	precondition(y.count == n)
 	
 	if n == 0 { return [] }
 	
 	if n == 1 {
-		y[0] = A.diagonal[0] * x[0]
+		y[0] += A.diagonal[0] * x[0]
 		return y
 	}
+	
 	x.withUnsafeBufferPointer { xPtr in
 		y.withUnsafeMutableBufferPointer { yPtr in
-			// y = d * x
+			// y += d * x
 			A.diagonal.withUnsafeBufferPointer { dPtr in
-				T.vma(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n )
+				T.vma(dPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress!, 1, n)
 			}
 			// y[0...n-2] += upper * x[1...n-1]
 			A.upper.withUnsafeBufferPointer { uPtr in
-				T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1 )
+				T.vma(uPtr.baseAddress!, 1, xPtr.baseAddress! + 1, 1, yPtr.baseAddress!, 1, n - 1)
 			}
 			// y[1...n-1] += lower * x[0...n-2]
 			A.lower.withUnsafeBufferPointer { lPtr in
-				T.vma( lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1 )
+				T.vma(lPtr.baseAddress!, 1, xPtr.baseAddress!, 1, yPtr.baseAddress! + 1, 1, n - 1)
 			}
-			
 		}
 	}
 	return y
 }
 
 // Helper: Complex multiply-add for a band: y += band * x
-@inline(__always) public func complexVMA<T: RealScalar>(_ band: [Complex<T>],_ x: UnsafePointer<T>,_ y: CMutablePtr<T>,
-														   _ temp: CMutablePtr<T>,_ count: Int ) {
+@inline(__always) public func complexVMA<T: RealScalar>(
+	_ band: [Complex<T>], _ x: UnsafePointer<T>, _ y: CMutablePtr<T>,
+	_ temp: CMutablePtr<T>, _ count: Int
+) {
 	band.withUnsafeBufferPointer { bandPtr in
 		bandPtr.baseAddress!.withMemoryRebound(to: T.self, capacity: 2*count) { b in
 			T.vma(b, 2, x, 2, y, 2, count)          // y.real += b.real * x.real
@@ -557,11 +643,10 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 	}
 }
 
-// Complex types versions
+// Complex scalar implementation
 @inlinable public func AXpY_<T: RealScalar>(
 	_ A: TridiagonalMatrix<Complex<T>>, _ x: [Complex<T>], _ y: inout [Complex<T>]
 ) -> [Complex<T>] {
-	
 	let n = x.count
 	precondition(n == A.size)
 	precondition(y.count == n)
@@ -573,16 +658,13 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 		return y
 	}
 	
-	// We need temp of size of diagonal = n, but off-diagonals only use n-1
-	let tempSize = n  // For diagonal computations
+	let tempSize = n
 	
 	if tempSize <= 1024 {
-		// Small: Use stack for both
 		withUnsafeTemporaryAllocation(of: T.self, capacity: tempSize) { temp in
 			computeAXpYWithTemps(A, x: x, y: &y, temp: temp.baseAddress!)
 		}
 	} else {
-		// Large: Use heap
 		let diagTemp = UnsafeMutableBufferPointer<T>.allocate(capacity: tempSize)
 		defer { diagTemp.deallocate() }
 		computeAXpYWithTemps(A, x: x, y: &y, temp: diagTemp.baseAddress!)
@@ -592,7 +674,7 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 
 // Version that reuses same temp array for both diagonal and off-diagonal
 @inlinable internal func computeAXpYWithTemps<T: RealScalar>(
-	_ A: TridiagonalMatrix<Complex<T>>, x: [Complex<T>], y: inout [Complex<T>],  temp: UnsafeMutablePointer<T>
+	_ A: TridiagonalMatrix<Complex<T>>, x: [Complex<T>], y: inout [Complex<T>], temp: UnsafeMutablePointer<T>
 ) {
 	let n = x.count
 	
@@ -605,13 +687,16 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 					complexVMA(A.lower, x, y+2, temp, n-1)
 				}
 			}
-			
 		}
 	}
 }
 
+// MARK: - Multiply Implementation Functions
+
 // Real scalar optimized implementation
-@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
+@inlinable public func multiply_<T: RealScalar>(
+	_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>
+) -> ColumnVector<T> {
 	precondition(x.count == A.size, "Invalid column vector size")
 	let n = x.count
 	if n == 0 { return [] }
@@ -625,9 +710,15 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 		result.withUnsafeMutableBufferPointer { resultPtr in
 			let xBase = xPtr.baseAddress!
 			let r = resultPtr.baseAddress!
-			A.diagonal.withUnsafeBufferPointer { dPtr in T.vmul(dPtr.baseAddress!, 1, xBase, 1, r, 1, n) }
-			A.upper.withUnsafeBufferPointer { uPtr in T.vma(uPtr.baseAddress!, 1, xBase + 1, 1, r, 1, n-1) }
-			A.lower.withUnsafeBufferPointer { lPtr in T.vma(lPtr.baseAddress!, 1, xBase, 1, r + 1, 1, n-1) }
+			A.diagonal.withUnsafeBufferPointer { dPtr in
+				T.vmul(dPtr.baseAddress!, 1, xBase, 1, r, 1, n)
+			}
+			A.upper.withUnsafeBufferPointer { uPtr in
+				T.vma(uPtr.baseAddress!, 1, xBase + 1, 1, r, 1, n-1)
+			}
+			A.lower.withUnsafeBufferPointer { lPtr in
+				T.vma(lPtr.baseAddress!, 1, xBase, 1, r + 1, 1, n-1)
+			}
 		}
 	}
 	
@@ -635,16 +726,21 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 }
 
 // Complex scalar optimized implementation
-@inlinable public func multiply_<T: RealScalar>(_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVector<Complex<T>>
+@inlinable public func multiply_<T: RealScalar>(
+	_ A: TridiagonalMatrix<Complex<T>>, _ x: ColumnVector<Complex<T>>
 ) -> ColumnVector<Complex<T>> {
 	precondition(x.count == A.size, "Invalid column vector size")
 	let n = x.count
 	if n == 0 { return [] }
 	if n == 1 { return [A.diagonal[0] * x[0]] }
 	
-	var result = [Complex<T>](unsafeUninitializedCapacity: n) { buffer, initializedCount in initializedCount = n }
+	var result = [Complex<T>](unsafeUninitializedCapacity: n) { buffer, initializedCount in
+		initializedCount = n
+	}
 	
-	var temp = [T](unsafeUninitializedCapacity: n) { buffer, initializedCount in initializedCount = n }
+	var temp = [T](unsafeUninitializedCapacity: n) { buffer, initializedCount in
+		initializedCount = n
+	}
 	
 	x.withUnsafeBufferPointer { xPtr in
 		result.withUnsafeMutableBufferPointer { resultPtr in
@@ -667,6 +763,8 @@ public final class TridiagonalWorkspace<T: ScalarField> {
 	return result
 }
 
-// MARK: -  Tridiagonal Matrix-Vector Multiplication Operator using protocol dispatch
+// MARK: - Tridiagonal Matrix-Vector Multiplication Operator
 @inlinable
-public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> { T.multiply(A, x) }
+public func *<T: ScalarField>(_ A: TridiagonalMatrix<T>, _ x: ColumnVector<T>) -> ColumnVector<T> {
+	T.multiply(A, x)
+}
